@@ -1,0 +1,138 @@
+use std::path::PathBuf;
+
+use anyhow::{Context, Result};
+use crate::domain::{Entry, EntryId, Tag, TagId};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct TagsFile {
+    #[serde(default)]
+    tags: Vec<Tag>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct EntriesFile {
+    #[serde(default)]
+    entries: Vec<Entry>,
+}
+
+/// File-based store using TOML.
+///
+/// All data is read from / written to two files: `tags.toml` and `entries.toml`
+/// inside the configured data directory.
+pub struct TomlStore {
+    data_dir: PathBuf,
+}
+
+impl TomlStore {
+    pub fn new(data_dir: impl Into<PathBuf>) -> Result<Self> {
+        let data_dir = data_dir.into();
+        std::fs::create_dir_all(&data_dir)
+            .with_context(|| format!("Failed to create data directory: {}", data_dir.display()))?;
+        Ok(Self { data_dir })
+    }
+
+    fn tags_path(&self) -> PathBuf {
+        self.data_dir.join("tags.toml")
+    }
+
+    fn entries_path(&self) -> PathBuf {
+        self.data_dir.join("entries.toml")
+    }
+
+    fn load_tags(&self) -> Result<TagsFile> {
+        let path = self.tags_path();
+        if !path.exists() {
+            return Ok(TagsFile::default());
+        }
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        toml::from_str(&content).context("Failed to parse tags.toml")
+    }
+
+    fn save_tags(&self, file: &TagsFile) -> Result<()> {
+        let content = toml::to_string_pretty(file).context("Failed to serialize tags")?;
+        std::fs::write(self.tags_path(), content)?;
+        Ok(())
+    }
+
+    fn load_entries(&self) -> Result<EntriesFile> {
+        let path = self.entries_path();
+        if !path.exists() {
+            return Ok(EntriesFile::default());
+        }
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        toml::from_str(&content).context("Failed to parse entries.toml")
+    }
+
+    fn save_entries(&self, file: &EntriesFile) -> Result<()> {
+        let content = toml::to_string_pretty(file).context("Failed to serialize entries")?;
+        std::fs::write(self.entries_path(), content)?;
+        Ok(())
+    }
+
+    // ── Tag operations ──────────────────────────────────────────────
+
+    pub fn create_tag(&self, tag: Tag) -> Result<Tag> {
+        let mut file = self.load_tags()?;
+        file.tags.push(tag.clone());
+        self.save_tags(&file)?;
+        Ok(tag)
+    }
+
+    pub fn list_tags(&self) -> Result<Vec<Tag>> {
+        Ok(self.load_tags()?.tags)
+    }
+
+    pub fn find_tags_by_name(&self, name: &str) -> Result<Vec<Tag>> {
+        let file = self.load_tags()?;
+        Ok(file.tags.into_iter().filter(|t| t.name == name).collect())
+    }
+
+    pub fn find_tag_by_id(&self, id: &TagId) -> Result<Option<Tag>> {
+        let file = self.load_tags()?;
+        Ok(file.tags.into_iter().find(|t| t.id == *id))
+    }
+
+    // ── Entry operations ────────────────────────────────────────────
+
+    pub fn create_entry(&self, entry: Entry) -> Result<Entry> {
+        let mut file = self.load_entries()?;
+        file.entries.push(entry.clone());
+        self.save_entries(&file)?;
+        Ok(entry)
+    }
+
+    pub fn list_entries(&self) -> Result<Vec<Entry>> {
+        Ok(self.load_entries()?.entries)
+    }
+
+    pub fn find_entry_by_id(&self, id: &EntryId) -> Result<Option<Entry>> {
+        let file = self.load_entries()?;
+        Ok(file.entries.into_iter().find(|e| e.id == *id))
+    }
+
+    pub fn find_entries_by_tag(&self, tag_id: &TagId) -> Result<Vec<Entry>> {
+        let file = self.load_entries()?;
+        Ok(file
+            .entries
+            .into_iter()
+            .filter(|e| e.tag_ids.contains(tag_id))
+            .collect())
+    }
+
+    pub fn add_tag_to_entry(&self, entry_id: &EntryId, tag_id: &TagId) -> Result<()> {
+        let mut file = self.load_entries()?;
+        let entry = file
+            .entries
+            .iter_mut()
+            .find(|e| e.id == *entry_id)
+            .context("Entry not found")?;
+        if !entry.tag_ids.contains(tag_id) {
+            entry.tag_ids.push(*tag_id);
+        }
+        self.save_entries(&file)?;
+        Ok(())
+    }
+}
