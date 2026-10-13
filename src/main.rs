@@ -56,6 +56,13 @@ enum TagCommands {
         /// Tag name or ID
         name_or_id: String,
     },
+    /// Rename a tag
+    Rename {
+        /// Tag name or ID
+        name_or_id: String,
+        /// New tag name
+        new_name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -258,6 +265,19 @@ fn handle_tag_show(store: &TomlStore, name_or_id: String) -> Result<()> {
     Ok(())
 }
 
+fn handle_tag_rename(store: &TomlStore, name_or_id: String, new_name: String) -> Result<()> {
+    let new_name = new_name.trim();
+    if new_name.is_empty() {
+        bail!("Tag name cannot be empty");
+    }
+    let tag = resolve_tag(store, &name_or_id)?;
+    let old_name = tag.name.clone();
+    let updated = store.rename_tag(&tag.id, new_name)?;
+    println!("Renamed tag '{}' to '{}':", old_name, updated.name);
+    print_tag_short(&updated);
+    Ok(())
+}
+
 fn handle_entry_add(
     store: &TomlStore,
     archiver: String,
@@ -415,6 +435,10 @@ fn run() -> Result<()> {
             }
             TagCommands::List { name } => handle_tag_list(&store, name),
             TagCommands::Show { name_or_id } => handle_tag_show(&store, name_or_id),
+            TagCommands::Rename {
+                name_or_id,
+                new_name,
+            } => handle_tag_rename(&store, name_or_id, new_name),
         },
         Commands::Entry { command } => match command {
             EntryCommands::Add {
@@ -436,5 +460,69 @@ fn main() {
     if let Err(e) = run() {
         eprintln!("Error: {e:#}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_disambiguation() {
+        assert_eq!(parse_disambiguation("rust"), ("rust", None));
+        assert_eq!(parse_disambiguation("rust#1"), ("rust", Some(1)));
+        assert_eq!(parse_disambiguation("rust#2"), ("rust", Some(2)));
+        assert_eq!(parse_disambiguation("rust#0"), ("rust#0", None));
+        assert_eq!(parse_disambiguation("rust#abc"), ("rust#abc", None));
+    }
+
+    #[test]
+    fn test_handle_tag_rename() {
+        let dir = std::env::temp_dir().join(format!("pantagraph_test_main_{}", uuid::Uuid::now_v7()));
+        let store = TomlStore::new(&dir).unwrap();
+        let tag = store.create_tag(Tag::new("old-tag", "desc")).unwrap();
+
+        // Rename via name
+        assert!(handle_tag_rename(&store, "old-tag".to_string(), "new-tag".to_string()).is_ok());
+        let updated = store.find_tag_by_id(&tag.id).unwrap().unwrap();
+        assert_eq!(updated.name, "new-tag");
+
+        // Rename via UUID
+        assert!(handle_tag_rename(&store, tag.id.to_string(), "uuid-renamed".to_string()).is_ok());
+        let updated2 = store.find_tag_by_id(&tag.id).unwrap().unwrap();
+        assert_eq!(updated2.name, "uuid-renamed");
+
+        // Disallow empty name
+        assert!(handle_tag_rename(&store, "uuid-renamed".to_string(), "   ".to_string()).is_err());
+
+        // Error if not found
+        assert!(handle_tag_rename(&store, "non-existent".to_string(), "valid".to_string()).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_handle_tag_rename_disambiguation() {
+        let dir = std::env::temp_dir().join(format!("pantagraph_test_disambig_{}", uuid::Uuid::now_v7()));
+        let store = TomlStore::new(&dir).unwrap();
+        let tag1 = store.create_tag(Tag::new("dupe", "first")).unwrap();
+        let tag2 = store.create_tag(Tag::new("dupe", "second")).unwrap();
+
+        // Ambiguous rename should fail without #N
+        assert!(handle_tag_rename(&store, "dupe".to_string(), "renamed".to_string()).is_err());
+
+        // Disambiguated rename should succeed
+        // Sorted by UUID order
+        let mut expected_order = vec![tag1.id, tag2.id];
+        expected_order.sort_by_key(|id| id.0);
+
+        assert!(handle_tag_rename(&store, "dupe#1".to_string(), "renamed-1".to_string()).is_ok());
+        let first_updated = store.find_tag_by_id(&expected_order[0]).unwrap().unwrap();
+        assert_eq!(first_updated.name, "renamed-1");
+
+        let second_original = store.find_tag_by_id(&expected_order[1]).unwrap().unwrap();
+        assert_eq!(second_original.name, "dupe");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

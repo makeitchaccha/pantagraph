@@ -89,6 +89,19 @@ impl TomlStore {
         Ok(self.load_tags()?.tags)
     }
 
+    pub fn rename_tag(&self, id: &TagId, new_name: &str) -> Result<Tag> {
+        let mut file = self.load_tags()?;
+        let tag = file
+            .tags
+            .iter_mut()
+            .find(|t| t.id == *id)
+            .context("Tag not found")?;
+        tag.name = new_name.to_string();
+        let updated = tag.clone();
+        self.save_tags(&file)?;
+        Ok(updated)
+    }
+
     pub fn find_tags_by_name(&self, name: &str) -> Result<Vec<Tag>> {
         let file = self.load_tags()?;
         Ok(file.tags.into_iter().filter(|t| t.name == name).collect())
@@ -138,5 +151,38 @@ impl TomlStore {
         }
         self.save_entries(&file)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rename_tag() {
+        let dir = std::env::temp_dir().join(format!("pantagraph_test_{}", uuid::Uuid::now_v7()));
+        let store = TomlStore::new(&dir).unwrap();
+        let tag = store.create_tag(Tag::new("old_name", "desc")).unwrap();
+
+        let updated = store.rename_tag(&tag.id, "new_name").unwrap();
+        assert_eq!(updated.name, "new_name");
+        assert_eq!(updated.description, "desc");
+        assert_eq!(updated.id, tag.id);
+
+        let fetched = store.find_tag_by_id(&tag.id).unwrap().unwrap();
+        assert_eq!(fetched.name, "new_name");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_rename_nonexistent_tag() {
+        let dir = std::env::temp_dir().join(format!("pantagraph_test_{}", uuid::Uuid::now_v7()));
+        let store = TomlStore::new(&dir).unwrap();
+        let fake_id = TagId::new();
+
+        assert!(store.rename_tag(&fake_id, "new_name").is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

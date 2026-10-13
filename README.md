@@ -87,6 +87,14 @@ pantagraph tag show <NAME_OR_ID>
 ```
 *Note: If multiple tags share the same name, use `name#N` (e.g. `rust#1`, `rust#2`) or the tag's UUID to disambiguate.*
 
+#### Rename a tag
+```bash
+pantagraph tag rename <NAME_OR_ID> <NEW_NAME>
+# Example:
+pantagraph tag rename rust rust-lang
+```
+*Note: If multiple tags share the same name, use `name#N` (e.g. `rust#1`, `rust#2`) or the tag's UUID to disambiguate.*
+
 ---
 
 ### 2. Entry Commands

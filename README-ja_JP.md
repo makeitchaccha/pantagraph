@@ -87,6 +87,14 @@ pantagraph tag show <NAME_OR_ID>
 ```
 *※ 同名のタグが複数存在する場合は、`rust#1` や `rust#2` のような指定、またはタグのUUIDで一意に特定できます。*
 
+#### タグ名の変更
+```bash
+pantagraph tag rename <NAME_OR_ID> <NEW_NAME>
+# 例:
+pantagraph tag rename rust rust-lang
+```
+*※ 同名のタグが複数存在する場合は、`rust#1` や `rust#2` のような指定、またはタグのUUIDで一意に特定できます。*
+
 ---
 
 ### 2. エントリ操作 (`entry`)
