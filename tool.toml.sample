@@ -1,0 +1,23 @@
+# tool.toml.sample
+# Configuration sample for external archivers in Pantagraph.
+# Place this file as `tool.toml` (in your current directory or in `<data_dir>/tool.toml`).
+
+[archiver.single-file]
+command = "single-file"
+args = [
+  "--browser-executable-path=google-chrome",
+  "--browser-headless=true",
+  "--output-directory={outdir}",
+  "{url}"
+]
+# Optional environment variables
+# [archiver.single-file.env]
+# CHROME_PATH = "/usr/bin/google-chrome"
+
+# Example for yt-dlp
+[archiver.ytdlp]
+command = "yt-dlp"
+args = [
+  "-P", "{outdir}",
+  "{url}"
+]
