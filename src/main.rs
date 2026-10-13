@@ -1,12 +1,16 @@
 use std::collections::HashMap;
 
+mod archiver;
 mod domain;
 mod store;
+
+use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use domain::{Entry, EntryId, Tag, TagId};
 use store::TomlStore;
+use archiver::ToolConfig;
 
 #[derive(Parser)]
 #[command(name = "pantagraph", about = "Index the web through human-assigned tags")]
@@ -58,8 +62,11 @@ enum TagCommands {
 
 #[derive(Subcommand)]
 enum EntryCommands {
-    /// Add a new entry (URL with tags)
+    /// Add a new entry (URL with tags, optionally archived)
     Add {
+        /// Archiver tool to use (e.g. single-file, default: none)
+        #[arg(long, default_value = "")]
+        archiver: String,
         /// URL to index
         url: String,
         /// Description of this entry
@@ -69,8 +76,11 @@ enum EntryCommands {
         #[arg(long, short)]
         tag: Vec<String>,
     },
-    /// List entries, optionally filtered by tag(s)
+    /// List entries, optionally filtered by tag(s) or archiver
     List {
+        /// Filter by archiver name
+        #[arg(long)]
+        archiver: Option<String>,
         /// Filter by tag (name or ID, repeatable — entries must match ALL)
         #[arg(long, short)]
         tag: Vec<String>,
@@ -177,7 +187,14 @@ fn print_entry_short(entry: &Entry, names: &HashMap<TagId, String>) {
     } else {
         tag_labels.join(", ")
     };
-    println!("{}  [{}]", entry.url, tags_str);
+    let archiver_badge = match &entry.archiver {
+        Some(a) if !a.is_empty() => format!("[{a}] "),
+        _ => String::new(),
+    };
+    println!("{}{entry_url}  [{tags_str}]", archiver_badge, entry_url = entry.url);
+    if let Some(archive_path) = &entry.archive_path {
+        println!("  archive: {}", archive_path);
+    }
     if !entry.description.is_empty() {
         println!("  {}", entry.description);
     }
@@ -233,19 +250,75 @@ fn handle_tag_show(store: &TomlStore, name_or_id: String) -> Result<()> {
     if !entries.is_empty() {
         println!("\nEntries ({}):", entries.len());
         for entry in &entries {
-            println!("  {}", entry.url);
+            let archiver_badge = match &entry.archiver {
+                Some(a) if !a.is_empty() => format!("[{a}] "),
+                _ => String::new(),
+            };
+            println!("  {}{}", archiver_badge, entry.url);
         }
     }
     Ok(())
 }
 
-fn handle_entry_add(store: &TomlStore, url: String, description: String, tag_refs: Vec<String>) -> Result<()> {
+fn handle_entry_add(
+    store: &TomlStore,
+    archiver: String,
+    url: String,
+    description: String,
+    tag_refs: Vec<String>,
+) -> Result<()> {
     let mut tag_ids = Vec::new();
     for tag_ref in &tag_refs {
         let tag = resolve_tag(store, tag_ref)?;
         tag_ids.push(tag.id);
     }
-    let entry = Entry::new(&url, &description, tag_ids);
+
+    let (archiver_opt, archive_path_opt) = if archiver.trim().is_empty() {
+        (None, None)
+    } else {
+        let archiver_name = archiver.trim();
+        let tool_config = ToolConfig::load_from_dir(store.data_dir())?;
+
+        // Determine destination file path
+        let archives_dir = store.data_dir().join("archives");
+        std::fs::create_dir_all(&archives_dir)
+            .with_context(|| format!("Failed to create directory {}", archives_dir.display()))?;
+
+        // Extension determined by archiver name or default to html
+        let ext = if archiver_name == "single-file" {
+            "html"
+        } else {
+            "archive"
+        };
+
+        // Create a unique entry ID upfront for archiving
+        let entry_id = EntryId::new();
+        let file_name = format!("{entry_id}.{ext}");
+        let full_output_path = archives_dir.join(&file_name);
+
+        println!("Archiving with '{}'...", archiver_name);
+        tool_config.execute_archiver(archiver_name, &url, &full_output_path)?;
+
+        let relative_path = format!("archives/{file_name}");
+        (Some(archiver_name.to_string()), Some(relative_path))
+    };
+
+    let mut entry = Entry::new(
+        &url,
+        archiver_opt,
+        archive_path_opt,
+        &description,
+        tag_ids,
+    );
+    // If we already generated an entry_id during archiving, use that ID
+    if let Some(ref path) = entry.archive_path {
+        if let Some(file_stem) = Path::new(path).file_stem().and_then(|s| s.to_str()) {
+            if let Ok(id) = file_stem.parse::<EntryId>() {
+                entry.id = id;
+            }
+        }
+    }
+
     let entry = store.create_entry(entry)?;
     let names = tag_name_map(store)?;
     println!("Created entry:");
@@ -253,20 +326,29 @@ fn handle_entry_add(store: &TomlStore, url: String, description: String, tag_ref
     Ok(())
 }
 
-fn handle_entry_list(store: &TomlStore, tag_refs: Vec<String>) -> Result<()> {
-    let entries: Vec<Entry> = if tag_refs.is_empty() {
-        store.list_entries()?
-    } else {
-        let mut tag_ids = Vec::new();
-        for tag_ref in &tag_refs {
-            let tag = resolve_tag(store, tag_ref)?;
-            tag_ids.push(tag.id);
+fn handle_entry_list(
+    store: &TomlStore,
+    archiver: Option<String>,
+    tag_refs: Vec<String>,
+) -> Result<()> {
+    let entries: Vec<Entry> = {
+        let mut entries = store.list_entries()?;
+        if let Some(target_archiver) = archiver {
+            if target_archiver.is_empty() {
+                entries.retain(|e| e.archiver.is_none());
+            } else {
+                entries.retain(|e| e.archiver.as_deref() == Some(&target_archiver));
+            }
         }
-        store
-            .list_entries()?
-            .into_iter()
-            .filter(|e| tag_ids.iter().all(|tid| e.tag_ids.contains(tid)))
-            .collect()
+        if !tag_refs.is_empty() {
+            let mut tag_ids = Vec::new();
+            for tag_ref in &tag_refs {
+                let tag = resolve_tag(store, tag_ref)?;
+                tag_ids.push(tag.id);
+            }
+            entries.retain(|e| tag_ids.iter().all(|tid| e.tag_ids.contains(tid)));
+        }
+        entries
     };
 
     let names = tag_name_map(store)?;
@@ -289,6 +371,12 @@ fn handle_entry_show(store: &TomlStore, id: String) -> Result<()> {
 
     println!("URL:         {}", entry.url);
     println!("ID:          {}", entry.id);
+    if let Some(ref archiver) = entry.archiver {
+        println!("Archiver:    {}", archiver);
+    }
+    if let Some(ref archive_path) = entry.archive_path {
+        println!("Archive:     {}", archive_path);
+    }
     println!(
         "Description: {}",
         if entry.description.is_empty() {
@@ -349,11 +437,14 @@ fn run() -> Result<()> {
         },
         Commands::Entry { command } => match command {
             EntryCommands::Add {
+                archiver,
                 url,
                 description,
                 tag,
-            } => handle_entry_add(&store, url, description, tag),
-            EntryCommands::List { tag } => handle_entry_list(&store, tag),
+            } => handle_entry_add(&store, archiver, url, description, tag),
+            EntryCommands::List { archiver, tag } => {
+                handle_entry_list(&store, archiver, tag)
+            }
             EntryCommands::Show { id } => handle_entry_show(&store, id),
             EntryCommands::Tag { entry_id, tag } => handle_entry_tag(&store, entry_id, tag),
         },

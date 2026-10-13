@@ -83,23 +83,36 @@ impl Tag {
     }
 }
 
-/// A URL with associated tags, representing indexed web content.
+/// An entry representing indexed content (bookmark URL or archived content).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entry {
     pub id: EntryId,
     pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archiver: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_path: Option<String>,
     #[serde(default)]
     pub description: String,
     pub tag_ids: Vec<TagId>,
 }
 
 impl Entry {
-    pub fn new(url: impl Into<String>, description: impl Into<String>, tag_ids: Vec<TagId>) -> Self {
+    pub fn new(
+        url: impl Into<String>,
+        archiver: Option<String>,
+        archive_path: Option<String>,
+        description: impl Into<String>,
+        tag_ids: Vec<TagId>,
+    ) -> Self {
         Self {
             id: EntryId::new(),
             url: url.into(),
+            archiver,
+            archive_path,
             description: description.into(),
             tag_ids,
         }
     }
 }
+

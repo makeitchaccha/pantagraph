@@ -32,6 +32,10 @@ impl TomlStore {
         Ok(Self { data_dir })
     }
 
+    pub fn data_dir(&self) -> &std::path::Path {
+        &self.data_dir
+    }
+
     fn tags_path(&self) -> PathBuf {
         self.data_dir.join("tags.toml")
     }
