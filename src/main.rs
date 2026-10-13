@@ -43,6 +43,9 @@ enum TagCommands {
     Create {
         /// Tag name
         name: String,
+        /// Optional specifier (e.g. name@specifier) to distinguish conflicting tags
+        #[arg(long = "specifier", short = 's')]
+        specifier: Option<String>,
         /// Tag description
         #[arg(long, short, default_value = "")]
         description: String,
@@ -158,24 +161,42 @@ enum EntryCommands {
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-/// Parse `"name#N"` into `("name", Some(N))`. Plain `"name"` returns `("name", None)`.
-fn parse_disambiguation(input: &str) -> (&str, Option<usize>) {
-    if let Some((name, suffix)) = input.rsplit_once('#') {
+/// Parse a tag reference string.
+///
+/// Supports:
+/// - `"name#N"` -> disambiguate by 1-based index (N)
+/// - `"name@specifier#N"` -> name + specifier + disambiguation index
+/// - `"name@specifier"` -> name + specifier
+/// - `"name"` -> plain name
+fn parse_tag_ref(input: &str) -> (&str, Option<&str>, Option<usize>) {
+    let (base, pick) = if let Some((base, suffix)) = input.rsplit_once('#') {
         if let Ok(n) = suffix.parse::<usize>() {
             if n >= 1 {
-                return (name, Some(n));
+                (base, Some(n))
+            } else {
+                (input, None)
             }
+        } else {
+            (input, None)
         }
+    } else {
+        (input, None)
+    };
+
+    if let Some((name, specifier)) = base.split_once('@') {
+        (name, Some(specifier), pick)
+    } else {
+        (base, None, pick)
     }
-    (input, None)
 }
 
 /// Resolve a tag reference to a single Tag.
 ///
 /// Accepted formats:
 /// - UUID string (exact ID lookup)
+/// - `name@specifier` (exact name/alias and specifier match)
 /// - Tag name (exact match; must be unique)
-/// - `name#N` (disambiguation: pick the Nth candidate, 1-indexed, sorted by UUID)
+/// - `name#N` or `name@specifier#N` (disambiguation: pick the Nth candidate, 1-indexed, sorted by UUID)
 fn resolve_tag(store: &TomlStore, name_or_id: &str) -> Result<Tag> {
     // Try as UUID first
     if let Ok(tag_id) = name_or_id.parse::<TagId>() {
@@ -184,58 +205,71 @@ fn resolve_tag(store: &TomlStore, name_or_id: &str) -> Result<Tag> {
         }
     }
 
-    // Try name#N disambiguation syntax
-    let (name, pick) = parse_disambiguation(name_or_id);
+    // Parse name, optional @specifier, and optional #N
+    let (name, specifier, pick) = parse_tag_ref(name_or_id);
 
-    let mut tags = store.find_tags_by_name_or_alias(name)?;
+    let mut tags = if let Some(spec) = specifier {
+        store.find_tags_by_name_and_specifier(name, spec)?
+    } else {
+        store.find_tags_by_name_or_alias(name)?
+    };
     tags.sort_by_key(|t| t.id.0);
 
     match (tags.len(), pick) {
-        (0, _) => bail!("Tag not found: {name}"),
+        (0, _) => bail!("Tag not found: {name_or_id}"),
         (1, _) => Ok(tags.into_iter().next().unwrap()),
         (_, Some(n)) => {
             let count = tags.len();
             tags.into_iter()
                 .nth(n - 1)
-                .with_context(|| format!("{name}#{n} is out of range (only {count} candidates)"))
+                .with_context(|| format!("{name_or_id} is out of range (only {count} candidates)"))
         }
         (_, None) => {
-            eprintln!("Multiple tags with name or alias '{name}':");
+            eprintln!("Multiple tags match '{name_or_id}':");
             for (i, tag) in tags.iter().enumerate() {
                 let alias_info = if tag.name != name && tag.aliases.iter().any(|a| a == name) {
                     format!(" [{}]", tag.name)
                 } else {
                     String::new()
                 };
-                if tag.description.is_empty() {
-                    eprintln!("  {name}#{}{alias_info}", i + 1);
+                let spec_info = if let Some(ref s) = tag.specifier {
+                    format!(" (@{s})")
                 } else {
-                    eprintln!("  {name}#{}{alias_info} {}", i + 1, tag.description);
+                    String::new()
+                };
+                if tag.description.is_empty() {
+                    eprintln!("  {name}#{}{spec_info}{alias_info}", i + 1);
+                } else {
+                    eprintln!("  {name}#{}{spec_info}{alias_info} {}", i + 1, tag.description);
                 }
             }
-            bail!("Ambiguous tag name. Use {name}#N to disambiguate.");
+            bail!("Ambiguous tag name. Use {name_or_id}#N (or specify @specifier) to disambiguate.");
         }
     }
 }
 
-/// Build a TagId → name lookup from all tags.
+/// Build a TagId → display name lookup from all tags.
 fn tag_name_map(store: &TomlStore) -> Result<HashMap<TagId, String>> {
     Ok(store
         .list_tags()?
         .into_iter()
-        .map(|t| (t.id, t.name))
+        .map(|t| (t.id, t.display_name()))
         .collect())
 }
 
 // ── Display ─────────────────────────────────────────────────────────
 
 fn print_tag_short(tag: &Tag) {
+    let display_name = tag.display_name();
     if tag.description.is_empty() {
-        println!("{}", tag.name);
+        println!("{}", display_name);
     } else {
-        println!("{} — {}", tag.name, tag.description);
+        println!("{} — {}", display_name, tag.description);
     }
     println!("  id: {}", tag.id);
+    if let Some(ref spec) = tag.specifier {
+        println!("  specifier: @{}", spec);
+    }
     if !tag.aliases.is_empty() {
         println!("  aliases: {}", tag.aliases.join(", "));
     }
@@ -269,21 +303,44 @@ fn print_entry_short(entry: &Entry, names: &HashMap<TagId, String>) {
 fn handle_tag_create(
     store: &TomlStore,
     name: String,
+    mut specifier: Option<String>,
     description: String,
     aliases: Vec<String>,
     policy: TagConflictPolicy,
 ) -> Result<()> {
-    let name = name.trim();
-    if name.is_empty() {
+    let name_trimmed = name.trim();
+    if name_trimmed.is_empty() {
         bail!("Tag name cannot be empty");
     }
+
+    // Support name@specifier in the positional name argument if -s wasn't provided
+    let (tag_name, parsed_spec) = if let Some((n, s)) = name_trimmed.split_once('@') {
+        (n.trim(), Some(s.trim()))
+    } else {
+        (name_trimmed, None)
+    };
+
+    if tag_name.is_empty() {
+        bail!("Tag name cannot be empty");
+    }
+
+    if specifier.is_none() && parsed_spec.is_some() {
+        let s = parsed_spec.unwrap();
+        if !s.is_empty() {
+            specifier = Some(s.to_string());
+        }
+    }
+
+    // Clean specifier
+    let clean_specifier = specifier.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+
     let mut clean_aliases = Vec::new();
     for a in aliases {
         let a = a.trim();
         if a.is_empty() {
             continue;
         }
-        if a == name {
+        if a == tag_name {
             bail!("Alias cannot be identical to the tag name: '{a}'");
         }
         if !clean_aliases.contains(&a.to_string()) {
@@ -292,11 +349,11 @@ fn handle_tag_create(
     }
 
     if policy != TagConflictPolicy::Ignore {
-        let conflicting_tags = store.find_tags_by_name_or_alias(name)?;
+        let conflicting_tags = store.find_tags_by_name_or_alias(tag_name)?;
         if !conflicting_tags.is_empty() {
             match policy {
                 TagConflictPolicy::Abort => {
-                    eprintln!("Error: Tag conflict detected for '{name}'.");
+                    eprintln!("Error: Tag conflict detected for '{tag_name}'.");
                     eprintln!("Existing matching tag(s):");
                     for t in &conflicting_tags {
                         let alias_str = if t.aliases.is_empty() {
@@ -304,12 +361,17 @@ fn handle_tag_create(
                         } else {
                             format!(" (aliases: {})", t.aliases.join(", "))
                         };
-                        eprintln!("  - ID: {} | name: '{}{alias_str}'", t.id, t.name);
+                        let spec_str = if let Some(ref s) = t.specifier {
+                            format!(" (@{s})")
+                        } else {
+                            String::new()
+                        };
+                        eprintln!("  - ID: {} | name: '{}{spec_str}{alias_str}'", t.id, t.name);
                     }
-                    bail!("Aborted due to tag conflict for '{name}'.");
+                    bail!("Aborted due to tag conflict for '{tag_name}'.");
                 }
                 TagConflictPolicy::WarnOnly => {
-                    eprintln!("Warning: Tag conflict detected for '{name}'.");
+                    eprintln!("Warning: Tag conflict detected for '{tag_name}'.");
                     eprintln!("Existing matching tag(s):");
                     for t in &conflicting_tags {
                         let alias_str = if t.aliases.is_empty() {
@@ -317,7 +379,12 @@ fn handle_tag_create(
                         } else {
                             format!(" (aliases: {})", t.aliases.join(", "))
                         };
-                        eprintln!("  - ID: {} | name: '{}{alias_str}'", t.id, t.name);
+                        let spec_str = if let Some(ref s) = t.specifier {
+                            format!(" (@{s})")
+                        } else {
+                            String::new()
+                        };
+                        eprintln!("  - ID: {} | name: '{}{spec_str}{alias_str}'", t.id, t.name);
                     }
                 }
                 TagConflictPolicy::Ignore => unreachable!(),
@@ -325,7 +392,7 @@ fn handle_tag_create(
         }
     }
 
-    let tag = Tag::with_aliases(name, description, clean_aliases);
+    let tag = Tag::with_specifier(tag_name, clean_specifier, description, clean_aliases);
     let tag = store.create_tag(tag)?;
     println!("Created tag:");
     print_tag_short(&tag);
@@ -360,6 +427,9 @@ fn handle_tag_show(store: &TomlStore, name_or_id: String) -> Result<()> {
     let tag = resolve_tag(store, &name_or_id)?;
     println!("Tag:         {}", tag.name);
     println!("ID:          {}", tag.id);
+    if let Some(ref spec) = tag.specifier {
+        println!("Specifier:   @{}", spec);
+    }
     println!(
         "Aliases:     {}",
         if tag.aliases.is_empty() {
@@ -593,12 +663,13 @@ fn run() -> Result<()> {
         Commands::Tag { command } => match command {
             TagCommands::Create {
                 name,
+                specifier,
                 description,
                 alias,
                 on_conflict,
             } => {
                 let policy = on_conflict.unwrap_or(config.tag.conflict_resolution);
-                handle_tag_create(&store, name, description, alias, policy)
+                handle_tag_create(&store, name, specifier, description, alias, policy)
             }
             TagCommands::List { name } => handle_tag_list(&store, name),
             TagCommands::Show { name_or_id } => handle_tag_show(&store, name_or_id),
@@ -652,12 +723,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_disambiguation() {
-        assert_eq!(parse_disambiguation("rust"), ("rust", None));
-        assert_eq!(parse_disambiguation("rust#1"), ("rust", Some(1)));
-        assert_eq!(parse_disambiguation("rust#2"), ("rust", Some(2)));
-        assert_eq!(parse_disambiguation("rust#0"), ("rust#0", None));
-        assert_eq!(parse_disambiguation("rust#abc"), ("rust#abc", None));
+    fn test_parse_tag_ref() {
+        assert_eq!(parse_tag_ref("rust"), ("rust", None, None));
+        assert_eq!(parse_tag_ref("rust#1"), ("rust", None, Some(1)));
+        assert_eq!(parse_tag_ref("rust#2"), ("rust", None, Some(2)));
+        assert_eq!(parse_tag_ref("rust#0"), ("rust#0", None, None));
+        assert_eq!(parse_tag_ref("rust#abc"), ("rust#abc", None, None));
+        assert_eq!(parse_tag_ref("rust@lang"), ("rust", Some("lang"), None));
+        assert_eq!(parse_tag_ref("rust@game#1"), ("rust", Some("game"), Some(1)));
     }
 
     #[test]
@@ -719,6 +792,7 @@ mod tests {
         assert!(handle_tag_create(
             &store,
             "rust".to_string(),
+            None,
             "Rust programming language".to_string(),
             vec!["rs".to_string(), "rust-lang".to_string()],
             TagConflictPolicy::Abort,
@@ -751,6 +825,7 @@ mod tests {
         assert!(handle_tag_create(
             &store,
             "systems".to_string(),
+            None,
             "".to_string(),
             vec!["sys".to_string()],
             TagConflictPolicy::Abort,
@@ -819,6 +894,7 @@ mod tests {
         let res_abort = handle_tag_create(
             &store,
             "alpha".to_string(),
+            None,
             "".to_string(),
             vec![],
             TagConflictPolicy::Abort,
@@ -829,6 +905,7 @@ mod tests {
         let res_alias_abort = handle_tag_create(
             &store,
             "al".to_string(),
+            None,
             "".to_string(),
             vec![],
             TagConflictPolicy::Abort,
@@ -839,6 +916,7 @@ mod tests {
         let res_warn = handle_tag_create(
             &store,
             "alpha".to_string(),
+            None,
             "".to_string(),
             vec![],
             TagConflictPolicy::WarnOnly,
@@ -849,6 +927,7 @@ mod tests {
         let res_ignore = handle_tag_create(
             &store,
             "alpha".to_string(),
+            None,
             "".to_string(),
             vec![],
             TagConflictPolicy::Ignore,
@@ -858,6 +937,52 @@ mod tests {
         // Now three tags with name "alpha" exist
         let found = store.find_tags_by_name_or_alias("alpha").unwrap();
         assert_eq!(found.len(), 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_tag_specifier_resolution() {
+        let dir = std::env::temp_dir().join(format!("pantagraph_test_specifier_{}", uuid::Uuid::now_v7()));
+        let store = TomlStore::new(&dir).unwrap();
+
+        // Create two tags with same name "rust", but different specifiers
+        assert!(handle_tag_create(
+            &store,
+            "rust@lang".to_string(),
+            None,
+            "Rust language".to_string(),
+            vec!["rs".to_string()],
+            TagConflictPolicy::Ignore,
+        ).is_ok());
+
+        assert!(handle_tag_create(
+            &store,
+            "rust".to_string(),
+            Some("game".to_string()),
+            "Rust video game".to_string(),
+            vec![],
+            TagConflictPolicy::Ignore,
+        ).is_ok());
+
+        // Bare "rust" is ambiguous
+        assert!(resolve_tag(&store, "rust").is_err());
+
+        // "rust@lang" resolves to the programming language tag
+        let lang_tag = resolve_tag(&store, "rust@lang").unwrap();
+        assert_eq!(lang_tag.name, "rust");
+        assert_eq!(lang_tag.specifier, Some("lang".to_string()));
+        assert_eq!(lang_tag.display_name(), "rust@lang");
+
+        // "rust@game" resolves to the video game tag
+        let game_tag = resolve_tag(&store, "rust@game").unwrap();
+        assert_eq!(game_tag.name, "rust");
+        assert_eq!(game_tag.specifier, Some("game".to_string()));
+        assert_eq!(game_tag.display_name(), "rust@game");
+
+        // Alias "rs@lang" also resolves correctly
+        let alias_spec = resolve_tag(&store, "rs@lang").unwrap();
+        assert_eq!(alias_spec.id, lang_tag.id);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

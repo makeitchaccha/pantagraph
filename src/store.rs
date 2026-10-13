@@ -118,6 +118,19 @@ impl TomlStore {
             .collect())
     }
 
+    pub fn find_tags_by_name_and_specifier(&self, name_or_alias: &str, specifier: &str) -> Result<Vec<Tag>> {
+        let file = self.load_tags()?;
+        Ok(file
+            .tags
+            .into_iter()
+            .filter(|t| {
+                let matches_name = t.name == name_or_alias || t.aliases.iter().any(|a| a == name_or_alias);
+                let matches_specifier = t.specifier.as_deref() == Some(specifier);
+                matches_name && matches_specifier
+            })
+            .collect())
+    }
+
     pub fn find_tag_by_id(&self, id: &TagId) -> Result<Option<Tag>> {
         let file = self.load_tags()?;
         Ok(file.tags.into_iter().find(|t| t.id == *id))

@@ -70,6 +70,8 @@ impl std::str::FromStr for EntryId {
 pub struct Tag {
     pub id: TagId,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub specifier: Option<String>,
     pub description: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub aliases: Vec<String>,
@@ -80,6 +82,7 @@ impl Tag {
         Self {
             id: TagId::new(),
             name: name.into(),
+            specifier: None,
             description: description.into(),
             aliases: Vec::new(),
         }
@@ -93,6 +96,30 @@ impl Tag {
         let mut tag = Self::new(name, description);
         tag.aliases = aliases;
         tag
+    }
+
+    pub fn with_specifier(
+        name: impl Into<String>,
+        specifier: Option<String>,
+        description: impl Into<String>,
+        aliases: Vec<String>,
+    ) -> Self {
+        Self {
+            id: TagId::new(),
+            name: name.into(),
+            specifier,
+            description: description.into(),
+            aliases,
+        }
+    }
+
+    /// Full display name, formatted as `name@specifier` if specifier is present, or `name`.
+    pub fn display_name(&self) -> String {
+        if let Some(ref spec) = self.specifier {
+            format!("{}@{}", self.name, spec)
+        } else {
+            self.name.clone()
+        }
     }
 }
 

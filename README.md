@@ -97,9 +97,12 @@ args = [
 
 #### Create a tag
 ```bash
-pantagraph tag create <NAME> [--description <DESC>] [--alias <ALIAS>...] [--on-conflict <abort|warn-only|ignore>]
+pantagraph tag create <NAME> [--specifier <SPEC>] [--description <DESC>] [--alias <ALIAS>...] [--on-conflict <abort|warn-only|ignore>]
 # Example:
 pantagraph tag create rust -d "Rust programming language" -a rs -a rust-lang
+# Or create with a specifier directly (via flag or name@specifier):
+pantagraph tag create "rust@lang" -d "Rust programming language"
+pantagraph tag create rust -s game -d "Rust survival game"
 ```
 *Note: `--on-conflict` overrides the `conflict_resolution` setting in `config.toml`.*
 
@@ -113,15 +116,15 @@ pantagraph tag list [--name <FILTER>]
 ```bash
 pantagraph tag show <NAME_OR_ALIAS_OR_ID>
 ```
-*Note: If multiple tags share the same name or alias, use `name#N` (e.g. `rust#1`, `rust#2`) or the tag's UUID to disambiguate.*
+*Note: If multiple tags share the same name or alias, use `name@specifier` (e.g. `rust@lang`), `name#N` (e.g. `rust#1`, `rust#2`), or the tag's UUID to disambiguate.*
 
 #### Rename a tag
 ```bash
 pantagraph tag rename <NAME_OR_ALIAS_OR_ID> <NEW_NAME>
 # Example:
-pantagraph tag rename rust rust-lang
+pantagraph tag rename rust@lang rust-lang
 ```
-*Note: If multiple tags share the same name or alias, use `name#N` (e.g. `rust#1`, `rust#2`) or the tag's UUID to disambiguate.*
+*Note: If multiple tags share the same name or alias, use `name@specifier`, `name#N`, or the tag's UUID to disambiguate.*
 
 #### Manage tag aliases
 Aliases can be used interchangeably with tag names in all commands (e.g., `tag show`, `tag rename`, `entry add --tag`, `entry list --tag`, `entry tag`).

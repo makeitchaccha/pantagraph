@@ -97,9 +97,12 @@ args = [
 
 #### タグの新規作成
 ```bash
-pantagraph tag create <NAME> [--description <DESC>] [--alias <ALIAS>...] [--on-conflict <abort|warn-only|ignore>]
+pantagraph tag create <NAME> [--specifier <SPEC>] [--description <DESC>] [--alias <ALIAS>...] [--on-conflict <abort|warn-only|ignore>]
 # 例:
 pantagraph tag create rust -d "プログラミング言語Rust" -a rs -a rust-lang
+# 修飾子（specifier）を付与して作成（フラグまたは name@specifier 形式）:
+pantagraph tag create "rust@lang" -d "プログラミング言語Rust"
+pantagraph tag create rust -s game -d "サバイバルゲームRust"
 ```
 *※ `--on-conflict` は `config.toml` の `conflict_resolution` 設定より優先されます。*
 
@@ -113,15 +116,15 @@ pantagraph tag list [--name <FILTER>]
 ```bash
 pantagraph tag show <NAME_OR_ALIAS_OR_ID>
 ```
-*※ 同名・同一エイリアスのタグが複数存在する場合は、`rust#1` や `rust#2` のような指定、またはタグのUUIDで一意に特定できます。*
+*※ 同名・同一エイリアスのタグが複数存在する場合は、`name@specifier`（例: `rust@lang`）、`name#N`（例: `rust#1`）、またはタグのUUIDで一意に特定できます。*
 
 #### タグ名の変更
 ```bash
 pantagraph tag rename <NAME_OR_ALIAS_OR_ID> <NEW_NAME>
 # 例:
-pantagraph tag rename rust rust-lang
+pantagraph tag rename rust@lang rust-lang
 ```
-*※ 同名・同一エイリアスのタグが複数存在する場合は、`rust#1` や `rust#2` のような指定、またはタグのUUIDで一意に特定できます。*
+*※ 同名・同一エイリアスのタグが複数存在する場合は、`name@specifier`、`name#N`、またはタグのUUIDで一意に特定できます。*
 
 #### タグエイリアスの管理
 エイリアスは通常のタグと同様に、すべてのコマンド（`tag show`, `tag rename`, `entry add --tag`, `entry list --tag`, `entry tag` など）で使用できます。
