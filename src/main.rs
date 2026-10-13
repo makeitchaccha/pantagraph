@@ -44,24 +44,71 @@ enum TagCommands {
         /// Tag description
         #[arg(long, short, default_value = "")]
         description: String,
+        /// Tag aliases (repeatable)
+        #[arg(long = "alias", short = 'a')]
+        alias: Vec<String>,
     },
     /// List all tags
     List {
-        /// Filter by name (substring match)
+        /// Filter by name or alias (substring match)
         #[arg(long)]
         name: Option<String>,
     },
     /// Show tag details
     Show {
-        /// Tag name or ID
+        /// Tag name, alias, or ID
         name_or_id: String,
     },
     /// Rename a tag
     Rename {
-        /// Tag name or ID
+        /// Tag name, alias, or ID
         name_or_id: String,
         /// New tag name
         new_name: String,
+    },
+    /// Manage tag aliases
+    Alias {
+        #[command(subcommand)]
+        command: TagAliasCommands,
+    },
+    /// Add an alias to a tag
+    #[command(name = "add-alias")]
+    AddAlias {
+        /// Tag name, alias, or ID
+        name_or_id: String,
+        /// Alias to add
+        alias: String,
+    },
+    /// Remove an alias from a tag
+    #[command(name = "remove-alias")]
+    RemoveAlias {
+        /// Tag name, alias, or ID
+        name_or_id: String,
+        /// Alias to remove
+        alias: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum TagAliasCommands {
+    /// Add an alias to a tag
+    Add {
+        /// Tag name, alias, or ID
+        name_or_id: String,
+        /// Alias to add
+        alias: String,
+    },
+    /// Remove an alias from a tag
+    Remove {
+        /// Tag name, alias, or ID
+        name_or_id: String,
+        /// Alias to remove
+        alias: String,
+    },
+    /// List aliases of a tag
+    List {
+        /// Tag name, alias, or ID
+        name_or_id: String,
     },
 }
 
@@ -135,7 +182,7 @@ fn resolve_tag(store: &TomlStore, name_or_id: &str) -> Result<Tag> {
     // Try name#N disambiguation syntax
     let (name, pick) = parse_disambiguation(name_or_id);
 
-    let mut tags = store.find_tags_by_name(name)?;
+    let mut tags = store.find_tags_by_name_or_alias(name)?;
     tags.sort_by_key(|t| t.id.0);
 
     match (tags.len(), pick) {
@@ -148,12 +195,17 @@ fn resolve_tag(store: &TomlStore, name_or_id: &str) -> Result<Tag> {
                 .with_context(|| format!("{name}#{n} is out of range (only {count} candidates)"))
         }
         (_, None) => {
-            eprintln!("Multiple tags with name '{name}':");
+            eprintln!("Multiple tags with name or alias '{name}':");
             for (i, tag) in tags.iter().enumerate() {
-                if tag.description.is_empty() {
-                    eprintln!("  {name}#{}", i + 1);
+                let alias_info = if tag.name != name && tag.aliases.iter().any(|a| a == name) {
+                    format!(" [{}]", tag.name)
                 } else {
-                    eprintln!("  {name}#{} {}", i + 1, tag.description);
+                    String::new()
+                };
+                if tag.description.is_empty() {
+                    eprintln!("  {name}#{}{alias_info}", i + 1);
+                } else {
+                    eprintln!("  {name}#{}{alias_info} {}", i + 1, tag.description);
                 }
             }
             bail!("Ambiguous tag name. Use {name}#N to disambiguate.");
@@ -179,6 +231,9 @@ fn print_tag_short(tag: &Tag) {
         println!("{} — {}", tag.name, tag.description);
     }
     println!("  id: {}", tag.id);
+    if !tag.aliases.is_empty() {
+        println!("  aliases: {}", tag.aliases.join(", "));
+    }
 }
 
 fn print_entry_short(entry: &Entry, names: &HashMap<TagId, String>) {
@@ -208,8 +263,30 @@ fn print_entry_short(entry: &Entry, names: &HashMap<TagId, String>) {
 
 // ── Subcommand handlers ─────────────────────────────────────────────
 
-fn handle_tag_create(store: &TomlStore, name: String, description: String) -> Result<()> {
-    let tag = Tag::new(&name, &description);
+fn handle_tag_create(
+    store: &TomlStore,
+    name: String,
+    description: String,
+    aliases: Vec<String>,
+) -> Result<()> {
+    let name = name.trim();
+    if name.is_empty() {
+        bail!("Tag name cannot be empty");
+    }
+    let mut clean_aliases = Vec::new();
+    for a in aliases {
+        let a = a.trim();
+        if a.is_empty() {
+            continue;
+        }
+        if a == name {
+            bail!("Alias cannot be identical to the tag name: '{a}'");
+        }
+        if !clean_aliases.contains(&a.to_string()) {
+            clean_aliases.push(a.to_string());
+        }
+    }
+    let tag = Tag::with_aliases(name, description, clean_aliases);
     let tag = store.create_tag(tag)?;
     println!("Created tag:");
     print_tag_short(&tag);
@@ -221,7 +298,10 @@ fn handle_tag_list(store: &TomlStore, name_filter: Option<String>) -> Result<()>
         store
             .list_tags()?
             .into_iter()
-            .filter(|t| t.name.contains(filter.as_str()))
+            .filter(|t| {
+                t.name.contains(filter.as_str())
+                    || t.aliases.iter().any(|a| a.contains(filter.as_str()))
+            })
             .collect()
     } else {
         store.list_tags()?
@@ -241,6 +321,14 @@ fn handle_tag_show(store: &TomlStore, name_or_id: String) -> Result<()> {
     let tag = resolve_tag(store, &name_or_id)?;
     println!("Tag:         {}", tag.name);
     println!("ID:          {}", tag.id);
+    println!(
+        "Aliases:     {}",
+        if tag.aliases.is_empty() {
+            "(none)".to_string()
+        } else {
+            tag.aliases.join(", ")
+        }
+    );
     println!(
         "Description: {}",
         if tag.description.is_empty() {
@@ -275,6 +363,39 @@ fn handle_tag_rename(store: &TomlStore, name_or_id: String, new_name: String) ->
     let updated = store.rename_tag(&tag.id, new_name)?;
     println!("Renamed tag '{}' to '{}':", old_name, updated.name);
     print_tag_short(&updated);
+    Ok(())
+}
+
+fn handle_tag_alias_add(store: &TomlStore, name_or_id: String, alias: String) -> Result<()> {
+    let tag = resolve_tag(store, &name_or_id)?;
+    let updated = store.add_tag_alias(&tag.id, &alias)?;
+    println!("Added alias '{}' to tag '{}':", alias.trim(), updated.name);
+    print_tag_short(&updated);
+    Ok(())
+}
+
+fn handle_tag_alias_remove(store: &TomlStore, name_or_id: String, alias: String) -> Result<()> {
+    let tag = resolve_tag(store, &name_or_id)?;
+    let updated = store.remove_tag_alias(&tag.id, &alias)?;
+    println!(
+        "Removed alias '{}' from tag '{}':",
+        alias.trim(),
+        updated.name
+    );
+    print_tag_short(&updated);
+    Ok(())
+}
+
+fn handle_tag_alias_list(store: &TomlStore, name_or_id: String) -> Result<()> {
+    let tag = resolve_tag(store, &name_or_id)?;
+    if tag.aliases.is_empty() {
+        println!("No aliases for tag '{}'.", tag.name);
+    } else {
+        println!("Aliases for tag '{}':", tag.name);
+        for alias in &tag.aliases {
+            println!("  {alias}");
+        }
+    }
     Ok(())
 }
 
@@ -430,15 +551,34 @@ fn run() -> Result<()> {
 
     match cli.command {
         Commands::Tag { command } => match command {
-            TagCommands::Create { name, description } => {
-                handle_tag_create(&store, name, description)
-            }
+            TagCommands::Create {
+                name,
+                description,
+                alias,
+            } => handle_tag_create(&store, name, description, alias),
             TagCommands::List { name } => handle_tag_list(&store, name),
             TagCommands::Show { name_or_id } => handle_tag_show(&store, name_or_id),
             TagCommands::Rename {
                 name_or_id,
                 new_name,
             } => handle_tag_rename(&store, name_or_id, new_name),
+            TagCommands::Alias { command } => match command {
+                TagAliasCommands::Add { name_or_id, alias } => {
+                    handle_tag_alias_add(&store, name_or_id, alias)
+                }
+                TagAliasCommands::Remove { name_or_id, alias } => {
+                    handle_tag_alias_remove(&store, name_or_id, alias)
+                }
+                TagAliasCommands::List { name_or_id } => {
+                    handle_tag_alias_list(&store, name_or_id)
+                }
+            },
+            TagCommands::AddAlias { name_or_id, alias } => {
+                handle_tag_alias_add(&store, name_or_id, alias)
+            }
+            TagCommands::RemoveAlias { name_or_id, alias } => {
+                handle_tag_alias_remove(&store, name_or_id, alias)
+            }
         },
         Commands::Entry { command } => match command {
             EntryCommands::Add {
@@ -513,7 +653,7 @@ mod tests {
 
         // Disambiguated rename should succeed
         // Sorted by UUID order
-        let mut expected_order = vec![tag1.id, tag2.id];
+        let mut expected_order = [tag1.id, tag2.id];
         expected_order.sort_by_key(|id| id.0);
 
         assert!(handle_tag_rename(&store, "dupe#1".to_string(), "renamed-1".to_string()).is_ok());
@@ -522,6 +662,101 @@ mod tests {
 
         let second_original = store.find_tag_by_id(&expected_order[1]).unwrap().unwrap();
         assert_eq!(second_original.name, "dupe");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_tag_alias_and_entry_integration() {
+        let dir = std::env::temp_dir().join(format!("pantagraph_test_alias_int_{}", uuid::Uuid::now_v7()));
+        let store = TomlStore::new(&dir).unwrap();
+
+        // 1. Create tag with aliases
+        assert!(handle_tag_create(
+            &store,
+            "rust".to_string(),
+            "Rust programming language".to_string(),
+            vec!["rs".to_string(), "rust-lang".to_string()]
+        ).is_ok());
+
+        // 2. Resolve by alias
+        let resolved = resolve_tag(&store, "rs").unwrap();
+        assert_eq!(resolved.name, "rust");
+
+        let resolved_alias2 = resolve_tag(&store, "rust-lang").unwrap();
+        assert_eq!(resolved_alias2.id, resolved.id);
+
+        // 3. Add entry using alias
+        assert!(handle_entry_add(
+            &store,
+            "".to_string(),
+            "https://www.rust-lang.org".to_string(),
+            "Rust website".to_string(),
+            vec!["rs".to_string()]
+        ).is_ok());
+
+        let entries = store.list_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].tag_ids, vec![resolved.id]);
+
+        // 4. Filter entries by alias
+        assert!(handle_entry_list(&store, None, vec!["rust-lang".to_string()]).is_ok());
+
+        // 5. Add another tag and attach via alias using handle_entry_tag
+        assert!(handle_tag_create(
+            &store,
+            "systems".to_string(),
+            "".to_string(),
+            vec!["sys".to_string()]
+        ).is_ok());
+
+        assert!(handle_entry_tag(&store, entries[0].id.to_string(), "sys".to_string()).is_ok());
+        let updated_entry = store.find_entry_by_id(&entries[0].id).unwrap().unwrap();
+        assert_eq!(updated_entry.tag_ids.len(), 2);
+
+        // 6. Rename tag referenced by alias
+        assert!(handle_tag_rename(&store, "rs".to_string(), "rustacean".to_string()).is_ok());
+        let renamed = resolve_tag(&store, "rs").unwrap();
+        assert_eq!(renamed.name, "rustacean");
+
+        // 7. Add & remove alias via CLI handler
+        assert!(handle_tag_alias_add(&store, "rustacean".to_string(), "crab".to_string()).is_ok());
+        let with_crab = resolve_tag(&store, "crab").unwrap();
+        assert_eq!(with_crab.name, "rustacean");
+
+        assert!(handle_tag_alias_list(&store, "crab".to_string()).is_ok());
+
+        assert!(handle_tag_alias_remove(&store, "crab".to_string(), "crab".to_string()).is_ok());
+        assert!(resolve_tag(&store, "crab").is_err());
+
+        // 8. Tag show works with alias
+        assert!(handle_tag_show(&store, "rs".to_string()).is_ok());
+
+        // 9. Tag list filter matches alias
+        assert!(handle_tag_list(&store, Some("rust-lan".to_string())).is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_tag_alias_disambiguation() {
+        let dir = std::env::temp_dir().join(format!("pantagraph_test_alias_dis_{}", uuid::Uuid::now_v7()));
+        let store = TomlStore::new(&dir).unwrap();
+
+        let tag1 = store.create_tag(Tag::with_aliases("first", "first tag", vec!["common".to_string()])).unwrap();
+        let tag2 = store.create_tag(Tag::with_aliases("second", "second tag", vec!["common".to_string()])).unwrap();
+
+        // Ambiguous without #N
+        assert!(resolve_tag(&store, "common").is_err());
+
+        let mut expected = [tag1.id, tag2.id];
+        expected.sort_by_key(|id| id.0);
+
+        let picked1 = resolve_tag(&store, "common#1").unwrap();
+        assert_eq!(picked1.id, expected[0]);
+
+        let picked2 = resolve_tag(&store, "common#2").unwrap();
+        assert_eq!(picked2.id, expected[1]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

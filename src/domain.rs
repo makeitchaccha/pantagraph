@@ -71,6 +71,8 @@ pub struct Tag {
     pub id: TagId,
     pub name: String,
     pub description: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
 }
 
 impl Tag {
@@ -79,7 +81,18 @@ impl Tag {
             id: TagId::new(),
             name: name.into(),
             description: description.into(),
+            aliases: Vec::new(),
         }
+    }
+
+    pub fn with_aliases(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        aliases: Vec<String>,
+    ) -> Self {
+        let mut tag = Self::new(name, description);
+        tag.aliases = aliases;
+        tag
     }
 }
 

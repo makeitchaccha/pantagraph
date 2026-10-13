@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use crate::domain::{Entry, EntryId, Tag, TagId};
 use serde::{Deserialize, Serialize};
 
@@ -97,19 +97,72 @@ impl TomlStore {
             .find(|t| t.id == *id)
             .context("Tag not found")?;
         tag.name = new_name.to_string();
+        tag.aliases.retain(|a| a != new_name);
         let updated = tag.clone();
         self.save_tags(&file)?;
         Ok(updated)
     }
 
+    #[allow(dead_code)]
     pub fn find_tags_by_name(&self, name: &str) -> Result<Vec<Tag>> {
         let file = self.load_tags()?;
         Ok(file.tags.into_iter().filter(|t| t.name == name).collect())
     }
 
+    pub fn find_tags_by_name_or_alias(&self, query: &str) -> Result<Vec<Tag>> {
+        let file = self.load_tags()?;
+        Ok(file
+            .tags
+            .into_iter()
+            .filter(|t| t.name == query || t.aliases.iter().any(|a| a == query))
+            .collect())
+    }
+
     pub fn find_tag_by_id(&self, id: &TagId) -> Result<Option<Tag>> {
         let file = self.load_tags()?;
         Ok(file.tags.into_iter().find(|t| t.id == *id))
+    }
+
+    pub fn add_tag_alias(&self, id: &TagId, alias: &str) -> Result<Tag> {
+        let alias = alias.trim();
+        if alias.is_empty() {
+            bail!("Alias cannot be empty");
+        }
+        let mut file = self.load_tags()?;
+        let tag = file
+            .tags
+            .iter_mut()
+            .find(|t| t.id == *id)
+            .context("Tag not found")?;
+        if tag.name == alias {
+            bail!("Alias cannot be identical to the tag name");
+        }
+        if tag.aliases.iter().any(|a| a == alias) {
+            bail!("Tag already has alias '{}'", alias);
+        }
+        tag.aliases.push(alias.to_string());
+        let updated = tag.clone();
+        self.save_tags(&file)?;
+        Ok(updated)
+    }
+
+    pub fn remove_tag_alias(&self, id: &TagId, alias: &str) -> Result<Tag> {
+        let alias = alias.trim();
+        let mut file = self.load_tags()?;
+        let tag = file
+            .tags
+            .iter_mut()
+            .find(|t| t.id == *id)
+            .context("Tag not found")?;
+        let pos = tag
+            .aliases
+            .iter()
+            .position(|a| a == alias)
+            .with_context(|| format!("Alias '{}' not found on tag '{}'", alias, tag.name))?;
+        tag.aliases.remove(pos);
+        let updated = tag.clone();
+        self.save_tags(&file)?;
+        Ok(updated)
     }
 
     // ── Entry operations ────────────────────────────────────────────
@@ -182,6 +235,53 @@ mod tests {
         let fake_id = TagId::new();
 
         assert!(store.rename_tag(&fake_id, "new_name").is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_add_and_remove_tag_alias() {
+        let dir = std::env::temp_dir().join(format!("pantagraph_test_alias_{}", uuid::Uuid::now_v7()));
+        let store = TomlStore::new(&dir).unwrap();
+        let tag = store.create_tag(Tag::new("rust", "Rust lang")).unwrap();
+
+        // Add alias
+        let updated = store.add_tag_alias(&tag.id, "rs").unwrap();
+        assert_eq!(updated.aliases, vec!["rs"]);
+
+        // Cannot add duplicate alias
+        assert!(store.add_tag_alias(&tag.id, "rs").is_err());
+
+        // Cannot add empty alias
+        assert!(store.add_tag_alias(&tag.id, "  ").is_err());
+
+        // Cannot add alias matching tag name
+        assert!(store.add_tag_alias(&tag.id, "rust").is_err());
+
+        // Add second alias
+        let updated2 = store.add_tag_alias(&tag.id, "rust-lang").unwrap();
+        assert_eq!(updated2.aliases, vec!["rs", "rust-lang"]);
+
+        // Find by alias
+        let found = store.find_tags_by_name_or_alias("rs").unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, tag.id);
+
+        let found_by_name = store.find_tags_by_name_or_alias("rust").unwrap();
+        assert_eq!(found_by_name.len(), 1);
+        assert_eq!(found_by_name[0].id, tag.id);
+
+        // Remove alias
+        let after_remove = store.remove_tag_alias(&tag.id, "rs").unwrap();
+        assert_eq!(after_remove.aliases, vec!["rust-lang"]);
+
+        // Removing non-existent alias errors
+        assert!(store.remove_tag_alias(&tag.id, "rs").is_err());
+
+        // Renaming to existing alias removes it from aliases
+        let renamed = store.rename_tag(&tag.id, "rust-lang").unwrap();
+        assert_eq!(renamed.name, "rust-lang");
+        assert!(renamed.aliases.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

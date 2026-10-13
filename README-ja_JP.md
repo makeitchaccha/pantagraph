@@ -6,7 +6,7 @@
 
 ## 特徴
 
-- **タグ管理**: 階層を持たないフラットなタグ管理。同名のタグもUUIDによって共存・識別可能（`name#N` 記法による曖昧さ解消）。
+- **タグ管理**: 階層を持たないフラットなタグ管理。エイリアス（別名）の設定に対応し、同名・同一エイリアスのタグもUUIDによって共存・識別可能（`name#N` 記法による曖昧さ解消）。
 - **エントリ管理**: WebのURL、説明、タグを紐付けて記録。
 - **プラグイン可能な外部アーカイバ**: `tool.toml` の設定により、外部ツール（`single-file` や `yt-dlp` など）を呼び出してローカルスナップショットを自動保存。
 - **TOMLベースのストレージ**: 人間が読みやすく、Git等のバージョン管理にも適したプレーンテキスト保存（`tags.toml`, `entries.toml`）。
@@ -71,29 +71,48 @@ args = [
 
 #### タグの新規作成
 ```bash
-pantagraph tag create <NAME> [--description <DESC>]
+pantagraph tag create <NAME> [--description <DESC>] [--alias <ALIAS>...]
 # 例:
-pantagraph tag create rust -d "プログラミング言語Rust"
+pantagraph tag create rust -d "プログラミング言語Rust" -a rs -a rust-lang
 ```
 
 #### タグ一覧の表示
 ```bash
 pantagraph tag list [--name <FILTER>]
 ```
+*※ タグ名およびエイリアスで部分一致検索が行われます。*
 
 #### タグ詳細の表示
 ```bash
-pantagraph tag show <NAME_OR_ID>
+pantagraph tag show <NAME_OR_ALIAS_OR_ID>
 ```
-*※ 同名のタグが複数存在する場合は、`rust#1` や `rust#2` のような指定、またはタグのUUIDで一意に特定できます。*
+*※ 同名・同一エイリアスのタグが複数存在する場合は、`rust#1` や `rust#2` のような指定、またはタグのUUIDで一意に特定できます。*
 
 #### タグ名の変更
 ```bash
-pantagraph tag rename <NAME_OR_ID> <NEW_NAME>
+pantagraph tag rename <NAME_OR_ALIAS_OR_ID> <NEW_NAME>
 # 例:
 pantagraph tag rename rust rust-lang
 ```
-*※ 同名のタグが複数存在する場合は、`rust#1` や `rust#2` のような指定、またはタグのUUIDで一意に特定できます。*
+*※ 同名・同一エイリアスのタグが複数存在する場合は、`rust#1` や `rust#2` のような指定、またはタグのUUIDで一意に特定できます。*
+
+#### タグエイリアスの管理
+エイリアスは通常のタグと同様に、すべてのコマンド（`tag show`, `tag rename`, `entry add --tag`, `entry list --tag`, `entry tag` など）で使用できます。
+
+```bash
+# エイリアスの追加
+pantagraph tag alias add <NAME_OR_ALIAS_OR_ID> <ALIAS>
+# 例:
+pantagraph tag alias add rust rs
+
+# エイリアスの削除
+pantagraph tag alias remove <NAME_OR_ALIAS_OR_ID> <ALIAS>
+# 例:
+pantagraph tag alias remove rust rs
+
+# エイリアス一覧の表示
+pantagraph tag alias list <NAME_OR_ALIAS_OR_ID>
+```
 
 ---
 

@@ -6,7 +6,7 @@ Index the web through human-assigned tags, with support for archiving content vi
 
 ## Features
 
-- **Tag Management**: Flat, human-assigned tags. Tags with the same name can coexist and be disambiguated cleanly.
+- **Tag Management**: Flat, human-assigned tags with alias support. Tags with the same name or alias can coexist and be disambiguated cleanly.
 - **Entry Management**: Save web URLs with descriptions and tags.
 - **Pluggable Archivers**: Save snapshots (HTML, videos, etc.) locally using external archivers (e.g., `single-file`, `yt-dlp`) configurable via `tool.toml`.
 - **TOML-based Storage**: Human-readable and version-controllable data storage (`tags.toml`, `entries.toml`).
@@ -71,29 +71,48 @@ args = [
 
 #### Create a tag
 ```bash
-pantagraph tag create <NAME> [--description <DESC>]
+pantagraph tag create <NAME> [--description <DESC>] [--alias <ALIAS>...]
 # Example:
-pantagraph tag create rust -d "Rust programming language"
+pantagraph tag create rust -d "Rust programming language" -a rs -a rust-lang
 ```
 
 #### List tags
 ```bash
 pantagraph tag list [--name <FILTER>]
 ```
+*Note: Filters by tag name or alias.*
 
 #### Show tag details
 ```bash
-pantagraph tag show <NAME_OR_ID>
+pantagraph tag show <NAME_OR_ALIAS_OR_ID>
 ```
-*Note: If multiple tags share the same name, use `name#N` (e.g. `rust#1`, `rust#2`) or the tag's UUID to disambiguate.*
+*Note: If multiple tags share the same name or alias, use `name#N` (e.g. `rust#1`, `rust#2`) or the tag's UUID to disambiguate.*
 
 #### Rename a tag
 ```bash
-pantagraph tag rename <NAME_OR_ID> <NEW_NAME>
+pantagraph tag rename <NAME_OR_ALIAS_OR_ID> <NEW_NAME>
 # Example:
 pantagraph tag rename rust rust-lang
 ```
-*Note: If multiple tags share the same name, use `name#N` (e.g. `rust#1`, `rust#2`) or the tag's UUID to disambiguate.*
+*Note: If multiple tags share the same name or alias, use `name#N` (e.g. `rust#1`, `rust#2`) or the tag's UUID to disambiguate.*
+
+#### Manage tag aliases
+Aliases can be used interchangeably with tag names in all commands (e.g., `tag show`, `tag rename`, `entry add --tag`, `entry list --tag`, `entry tag`).
+
+```bash
+# Add an alias to a tag
+pantagraph tag alias add <NAME_OR_ALIAS_OR_ID> <ALIAS>
+# Example:
+pantagraph tag alias add rust rs
+
+# Remove an alias from a tag
+pantagraph tag alias remove <NAME_OR_ALIAS_OR_ID> <ALIAS>
+# Example:
+pantagraph tag alias remove rust rs
+
+# List aliases for a tag
+pantagraph tag alias list <NAME_OR_ALIAS_OR_ID>
+```
 
 ---
 
