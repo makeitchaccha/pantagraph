@@ -4,8 +4,6 @@ mod archiver;
 mod domain;
 mod store;
 
-use std::path::Path;
-
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use domain::{Entry, EntryId, Tag, TagId};
@@ -273,33 +271,23 @@ fn handle_entry_add(
         tag_ids.push(tag.id);
     }
 
+    let entry_id = EntryId::new();
+
     let (archiver_opt, archive_path_opt) = if archiver.trim().is_empty() {
         (None, None)
     } else {
         let archiver_name = archiver.trim();
         let tool_config = ToolConfig::load_from_dir(store.data_dir())?;
 
-        // Determine destination file path
-        let archives_dir = store.data_dir().join("archives");
-        std::fs::create_dir_all(&archives_dir)
-            .with_context(|| format!("Failed to create directory {}", archives_dir.display()))?;
-
-        // Extension determined by archiver name or default to html
-        let ext = if archiver_name == "single-file" {
-            "html"
-        } else {
-            "archive"
-        };
-
-        // Create a unique entry ID upfront for archiving
-        let entry_id = EntryId::new();
-        let file_name = format!("{entry_id}.{ext}");
-        let full_output_path = archives_dir.join(&file_name);
+        // Entry-specific archive directory: <data_dir>/archives/<entry_id>/
+        let outdir = store.data_dir().join("archives").join(entry_id.to_string());
+        std::fs::create_dir_all(&outdir)
+            .with_context(|| format!("Failed to create directory {}", outdir.display()))?;
 
         println!("Archiving with '{}'...", archiver_name);
-        tool_config.execute_archiver(archiver_name, &url, &full_output_path)?;
+        tool_config.execute_archiver(archiver_name, &url, &outdir)?;
 
-        let relative_path = format!("archives/{file_name}");
+        let relative_path = format!("archives/{entry_id}");
         (Some(archiver_name.to_string()), Some(relative_path))
     };
 
@@ -310,14 +298,7 @@ fn handle_entry_add(
         &description,
         tag_ids,
     );
-    // If we already generated an entry_id during archiving, use that ID
-    if let Some(ref path) = entry.archive_path {
-        if let Some(file_stem) = Path::new(path).file_stem().and_then(|s| s.to_str()) {
-            if let Ok(id) = file_stem.parse::<EntryId>() {
-                entry.id = id;
-            }
-        }
-    }
+    entry.id = entry_id;
 
     let entry = store.create_entry(entry)?;
     let names = tag_name_map(store)?;

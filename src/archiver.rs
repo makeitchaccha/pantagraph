@@ -8,7 +8,7 @@ use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ArchiverToolConfig {
-    /// Command or path to executable (e.g. "single-file")
+    /// Command or path to executable
     pub command: Option<String>,
     /// Arguments template or fixed list of args
     #[serde(default)]
@@ -47,58 +47,45 @@ impl ToolConfig {
         Ok(config)
     }
 
-    /// Run archiver for a given url and output path.
+    /// Run archiver for a given url and output directory.
     pub fn execute_archiver(
         &self,
         archiver_name: &str,
         url: &str,
-        output_path: &Path,
+        outdir: &Path,
     ) -> Result<()> {
-        let config = self.archiver.get(archiver_name).cloned().unwrap_or_default();
+        let config = self
+            .archiver
+            .get(archiver_name)
+            .ok_or_else(|| anyhow::anyhow!("Archiver '{}' not configured in tool.toml", archiver_name))?;
 
         let binary = config
             .command
-            .unwrap_or_else(|| archiver_name.to_string());
+            .as_deref()
+            .unwrap_or(archiver_name);
 
-        let mut cmd = Command::new(&binary);
+        if config.args.is_empty() {
+            bail!(
+                "Archiver '{}' has no args specified in tool.toml. Arguments must be explicitly specified.",
+                archiver_name
+            );
+        }
+
+        let mut cmd = Command::new(binary);
 
         for (k, v) in &config.env {
             cmd.env(k, v);
         }
 
-        let output_str = output_path.to_string_lossy().to_string();
+        let outdir_str = outdir.to_string_lossy().to_string();
 
-        if config.args.is_empty() {
-            // Default arguments if not specified in tool.toml
-            if archiver_name == "single-file" {
-                // If google-chrome / chromium executable exists, pass it if needed, or rely on PATH
-                cmd.arg(url).arg(&output_str);
-            } else {
-                cmd.arg(url).arg(&output_str);
-            }
-        } else {
-            // If user defined custom args with placeholders `{url}` and `{output}`
-            let mut has_url = false;
-            let mut has_output = false;
-            for arg in &config.args {
-                let replaced = arg
-                    .replace("{url}", url)
-                    .replace("{output}", &output_str);
-                if arg.contains("{url}") {
-                    has_url = true;
-                }
-                if arg.contains("{output}") {
-                    has_output = true;
-                }
-                cmd.arg(replaced);
-            }
-            // If placeholders were not used, append url and output at the end
-            if !has_url {
-                cmd.arg(url);
-            }
-            if !has_output {
-                cmd.arg(&output_str);
-            }
+        for arg in &config.args {
+            let replaced = arg
+                .replace("{url}", url)
+                .replace("{outdir}", &outdir_str)
+                // keep {output} as synonym for {outdir} for flexibility
+                .replace("{output}", &outdir_str);
+            cmd.arg(replaced);
         }
 
         let status = cmd
@@ -110,14 +97,6 @@ impl ToolConfig {
                 "Archiver '{}' failed with exit status {}",
                 archiver_name,
                 status
-            );
-        }
-
-        if !output_path.exists() {
-            bail!(
-                "Archiver '{}' completed successfully but output file was not found at {}",
-                archiver_name,
-                output_path.display()
             );
         }
 
