@@ -29,7 +29,33 @@ cargo run -- <COMMAND>
 
 ---
 
-## 設定 (`tool.toml`)
+## 設定
+ 
+### 1. 全体設定 (`config.toml`)
+ 
+Pantagraph はデータディレクトリ直下（例: `data/config.toml`）またはカレントディレクトリから `config.toml` を読み込みます。
+サンプル設定ファイルとして [`config.toml.sample`](config.toml.sample) が用意されています:
+ 
+```bash
+cp config.toml.sample config.toml
+```
+ 
+#### タグ競合解決オプション (`conflict_resolution`)
+ 
+既存のタグ名またはエイリアスと重複するタグを新規作成する際の挙動を `config.toml`、またはコマンドライン引数 `--on-conflict <abort|warn-only|ignore>` で指定できます:
+ 
+```toml
+[tag]
+conflict_resolution = "warn_only" # "warn_only" | "abort" | "ignore"
+```
+ 
+- **`"abort"`**: 競合が検出された場合、エラーを表示して即座に中断（終了）します。
+- **`"warn_only"`** (デフォルト): 標準エラー出力に重複するタグ情報を警告表示し、そのままタグを作成します。
+- **`"ignore"`**: 警告を出さず完全に無視してそのままタグを作成します。
+ 
+---
+ 
+### 2. アーカイバ設定 (`tool.toml`)
 
 Pantagraph では、外部のアーカイブツールを柔軟に設定できます。設定ファイル `tool.toml` は、データディレクトリ直下（例: `data/tool.toml`）またはカレントディレクトリから読み込まれます。
 
@@ -71,10 +97,11 @@ args = [
 
 #### タグの新規作成
 ```bash
-pantagraph tag create <NAME> [--description <DESC>] [--alias <ALIAS>...]
+pantagraph tag create <NAME> [--description <DESC>] [--alias <ALIAS>...] [--on-conflict <abort|warn-only|ignore>]
 # 例:
 pantagraph tag create rust -d "プログラミング言語Rust" -a rs -a rust-lang
 ```
+*※ `--on-conflict` は `config.toml` の `conflict_resolution` 設定より優先されます。*
 
 #### タグ一覧の表示
 ```bash

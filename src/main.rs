@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 mod archiver;
+mod config;
 mod domain;
 mod store;
 
@@ -9,6 +10,7 @@ use clap::{Parser, Subcommand};
 use domain::{Entry, EntryId, Tag, TagId};
 use store::TomlStore;
 use archiver::ToolConfig;
+use config::{Config, TagConflictPolicy};
 
 #[derive(Parser)]
 #[command(name = "pantagraph", about = "Index the web through human-assigned tags")]
@@ -47,6 +49,9 @@ enum TagCommands {
         /// Tag aliases (repeatable)
         #[arg(long = "alias", short = 'a')]
         alias: Vec<String>,
+        /// Tag conflict resolution policy (abort, warn-only, ignore)
+        #[arg(long = "on-conflict")]
+        on_conflict: Option<TagConflictPolicy>,
     },
     /// List all tags
     List {
@@ -261,13 +266,12 @@ fn print_entry_short(entry: &Entry, names: &HashMap<TagId, String>) {
     println!("  id: {}", entry.id);
 }
 
-// ── Subcommand handlers ─────────────────────────────────────────────
-
 fn handle_tag_create(
     store: &TomlStore,
     name: String,
     description: String,
     aliases: Vec<String>,
+    policy: TagConflictPolicy,
 ) -> Result<()> {
     let name = name.trim();
     if name.is_empty() {
@@ -286,6 +290,41 @@ fn handle_tag_create(
             clean_aliases.push(a.to_string());
         }
     }
+
+    if policy != TagConflictPolicy::Ignore {
+        let conflicting_tags = store.find_tags_by_name_or_alias(name)?;
+        if !conflicting_tags.is_empty() {
+            match policy {
+                TagConflictPolicy::Abort => {
+                    eprintln!("Error: Tag conflict detected for '{name}'.");
+                    eprintln!("Existing matching tag(s):");
+                    for t in &conflicting_tags {
+                        let alias_str = if t.aliases.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" (aliases: {})", t.aliases.join(", "))
+                        };
+                        eprintln!("  - ID: {} | name: '{}{alias_str}'", t.id, t.name);
+                    }
+                    bail!("Aborted due to tag conflict for '{name}'.");
+                }
+                TagConflictPolicy::WarnOnly => {
+                    eprintln!("Warning: Tag conflict detected for '{name}'.");
+                    eprintln!("Existing matching tag(s):");
+                    for t in &conflicting_tags {
+                        let alias_str = if t.aliases.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" (aliases: {})", t.aliases.join(", "))
+                        };
+                        eprintln!("  - ID: {} | name: '{}{alias_str}'", t.id, t.name);
+                    }
+                }
+                TagConflictPolicy::Ignore => unreachable!(),
+            }
+        }
+    }
+
     let tag = Tag::with_aliases(name, description, clean_aliases);
     let tag = store.create_tag(tag)?;
     println!("Created tag:");
@@ -548,6 +587,7 @@ fn handle_entry_tag(store: &TomlStore, entry_id: String, tag_ref: String) -> Res
 fn run() -> Result<()> {
     let cli = Cli::parse();
     let store = TomlStore::new(&cli.data_dir)?;
+    let config = Config::load_from_dir(store.data_dir())?;
 
     match cli.command {
         Commands::Tag { command } => match command {
@@ -555,7 +595,11 @@ fn run() -> Result<()> {
                 name,
                 description,
                 alias,
-            } => handle_tag_create(&store, name, description, alias),
+                on_conflict,
+            } => {
+                let policy = on_conflict.unwrap_or(config.tag.conflict_resolution);
+                handle_tag_create(&store, name, description, alias, policy)
+            }
             TagCommands::List { name } => handle_tag_list(&store, name),
             TagCommands::Show { name_or_id } => handle_tag_show(&store, name_or_id),
             TagCommands::Rename {
@@ -676,7 +720,8 @@ mod tests {
             &store,
             "rust".to_string(),
             "Rust programming language".to_string(),
-            vec!["rs".to_string(), "rust-lang".to_string()]
+            vec!["rs".to_string(), "rust-lang".to_string()],
+            TagConflictPolicy::Abort,
         ).is_ok());
 
         // 2. Resolve by alias
@@ -707,7 +752,8 @@ mod tests {
             &store,
             "systems".to_string(),
             "".to_string(),
-            vec!["sys".to_string()]
+            vec!["sys".to_string()],
+            TagConflictPolicy::Abort,
         ).is_ok());
 
         assert!(handle_entry_tag(&store, entries[0].id.to_string(), "sys".to_string()).is_ok());
@@ -757,6 +803,61 @@ mod tests {
 
         let picked2 = resolve_tag(&store, "common#2").unwrap();
         assert_eq!(picked2.id, expected[1]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_tag_create_conflict_policies() {
+        let dir = std::env::temp_dir().join(format!("pantagraph_test_conflict_{}", uuid::Uuid::now_v7()));
+        let store = TomlStore::new(&dir).unwrap();
+
+        // Initial tag
+        store.create_tag(Tag::with_aliases("alpha", "desc", vec!["al".to_string()])).unwrap();
+
+        // 1. Conflict on name with TagConflictPolicy::Abort -> err
+        let res_abort = handle_tag_create(
+            &store,
+            "alpha".to_string(),
+            "".to_string(),
+            vec![],
+            TagConflictPolicy::Abort,
+        );
+        assert!(res_abort.is_err());
+
+        // 2. Conflict on alias with TagConflictPolicy::Abort -> err
+        let res_alias_abort = handle_tag_create(
+            &store,
+            "al".to_string(),
+            "".to_string(),
+            vec![],
+            TagConflictPolicy::Abort,
+        );
+        assert!(res_alias_abort.is_err());
+
+        // 3. Conflict with TagConflictPolicy::WarnOnly -> succeeds and warns
+        let res_warn = handle_tag_create(
+            &store,
+            "alpha".to_string(),
+            "".to_string(),
+            vec![],
+            TagConflictPolicy::WarnOnly,
+        );
+        assert!(res_warn.is_ok());
+
+        // 4. Conflict with TagConflictPolicy::Ignore -> succeeds
+        let res_ignore = handle_tag_create(
+            &store,
+            "alpha".to_string(),
+            "".to_string(),
+            vec![],
+            TagConflictPolicy::Ignore,
+        );
+        assert!(res_ignore.is_ok());
+
+        // Now three tags with name "alpha" exist
+        let found = store.find_tags_by_name_or_alias("alpha").unwrap();
+        assert_eq!(found.len(), 3);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

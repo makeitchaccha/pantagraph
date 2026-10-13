@@ -29,7 +29,33 @@ cargo run -- <COMMAND>
 
 ---
 
-## Configuration (`tool.toml`)
+## Configuration
+
+### 1. General Configuration (`config.toml`)
+
+Pantagraph looks for `config.toml` in your data directory (e.g. `data/config.toml`) or the current working directory.
+A sample configuration is provided in [`config.toml.sample`](tool.toml.sample):
+
+```bash
+cp config.toml.sample config.toml
+```
+
+#### Tag Conflict Resolution Options
+
+When adding a new tag whose name or alias matches an existing tag, behavior can be customized in `config.toml` or overridden per command via `--on-conflict <abort|warn-only|ignore>`:
+
+```toml
+[tag]
+conflict_resolution = "warn_only" # "warn_only" | "abort" | "ignore"
+```
+
+- **`"abort"`**: Abort immediately with an error if a conflict is detected.
+- **`"warn_only"`** (Default): Print a warning to stderr listing conflicting tags and continue creating the tag.
+- **`"ignore"`**: Completely ignore conflicts without warnings.
+
+---
+
+### 2. Archiver Tool Configuration (`tool.toml`)
 
 Pantagraph allows you to configure external archiving tools flexibly. By default, it looks for `tool.toml` in your data directory (e.g. `data/tool.toml`) or the current working directory.
 
@@ -71,10 +97,11 @@ args = [
 
 #### Create a tag
 ```bash
-pantagraph tag create <NAME> [--description <DESC>] [--alias <ALIAS>...]
+pantagraph tag create <NAME> [--description <DESC>] [--alias <ALIAS>...] [--on-conflict <abort|warn-only|ignore>]
 # Example:
 pantagraph tag create rust -d "Rust programming language" -a rs -a rust-lang
 ```
+*Note: `--on-conflict` overrides the `conflict_resolution` setting in `config.toml`.*
 
 #### List tags
 ```bash
