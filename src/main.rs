@@ -349,11 +349,24 @@ fn handle_tag_create(
     }
 
     if policy != TagConflictPolicy::Ignore {
-        let conflicting_tags = store.find_tags_by_name_or_alias(tag_name)?;
+        // If a specifier is provided, only tags with matching name/alias AND the exact same specifier conflict.
+        // If no specifier is provided, ANY existing tag with matching name/alias conflicts.
+        let conflicting_tags = if let Some(ref spec) = clean_specifier {
+            store.find_tags_by_name_and_specifier(tag_name, spec)?
+        } else {
+            store.find_tags_by_name_or_alias(tag_name)?
+        };
+
         if !conflicting_tags.is_empty() {
+            let conflict_label = if let Some(ref s) = clean_specifier {
+                format!("{tag_name}@{s}")
+            } else {
+                tag_name.to_string()
+            };
+
             match policy {
                 TagConflictPolicy::Abort => {
-                    eprintln!("Error: Tag conflict detected for '{tag_name}'.");
+                    eprintln!("Error: Tag conflict detected for '{conflict_label}'.");
                     eprintln!("Existing matching tag(s):");
                     for t in &conflicting_tags {
                         let alias_str = if t.aliases.is_empty() {
@@ -368,10 +381,10 @@ fn handle_tag_create(
                         };
                         eprintln!("  - ID: {} | name: '{}{spec_str}{alias_str}'", t.id, t.name);
                     }
-                    bail!("Aborted due to tag conflict for '{tag_name}'.");
+                    bail!("Aborted due to tag conflict for '{conflict_label}'.");
                 }
                 TagConflictPolicy::WarnOnly => {
-                    eprintln!("Warning: Tag conflict detected for '{tag_name}'.");
+                    eprintln!("Warning: Tag conflict detected for '{conflict_label}'.");
                     eprintln!("Existing matching tag(s):");
                     for t in &conflicting_tags {
                         let alias_str = if t.aliases.is_empty() {
@@ -983,6 +996,47 @@ mod tests {
         // Alias "rs@lang" also resolves correctly
         let alias_spec = resolve_tag(&store, "rs@lang").unwrap();
         assert_eq!(alias_spec.id, lang_tag.id);
+
+        // When rust@lang and rust@game exist:
+        // 1. Adding "rust@editor" with TagConflictPolicy::Abort passes without error (no conflict on rust@editor)
+        assert!(handle_tag_create(
+            &store,
+            "rust@editor".to_string(),
+            None,
+            "Rust editor".to_string(),
+            vec![],
+            TagConflictPolicy::Abort,
+        ).is_ok());
+
+        // 2. Adding "rust@lang" again with TagConflictPolicy::Abort fails (conflict on rust@lang)
+        assert!(handle_tag_create(
+            &store,
+            "rust@lang".to_string(),
+            None,
+            "Rust lang duplicate".to_string(),
+            vec![],
+            TagConflictPolicy::Abort,
+        ).is_err());
+
+        // 3. Adding bare "rust" without specifier with TagConflictPolicy::Abort fails (conflicts with existing "rust" tags)
+        assert!(handle_tag_create(
+            &store,
+            "rust".to_string(),
+            None,
+            "Bare rust".to_string(),
+            vec![],
+            TagConflictPolicy::Abort,
+        ).is_err());
+
+        // 4. Adding bare "rust" with TagConflictPolicy::WarnOnly succeeds
+        assert!(handle_tag_create(
+            &store,
+            "rust".to_string(),
+            None,
+            "Bare rust".to_string(),
+            vec![],
+            TagConflictPolicy::WarnOnly,
+        ).is_ok());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
