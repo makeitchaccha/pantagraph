@@ -2,10 +2,12 @@
 name = "pantagraph"
 version = "0.1.0"
 edition = "2021"
+default-run = "pantagraph"
 
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+rand = "0.10.3"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 uuid = { version = "1.7", features = ["v7", "serde"] }
