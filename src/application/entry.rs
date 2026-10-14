@@ -87,26 +87,16 @@ pub fn handle_entry_list(
     archiver: Option<String>,
     tag_refs: Vec<String>,
 ) -> Result<EntryResult> {
-    let entries: Vec<Entry> = {
-        let mut entries = store.list_entries()?;
-        if let Some(target_archiver) = archiver {
-            if target_archiver.is_empty() {
-                entries.retain(|e| e.archiver.is_none());
-            } else {
-                entries.retain(|e| e.archiver.as_deref() == Some(&target_archiver));
-            }
-        }
-        if !tag_refs.is_empty() {
-            let mut tag_ids = Vec::new();
-            for tag_ref in &tag_refs {
-                let tag = resolve_tag(store, tag_ref)?;
-                tag_ids.push(tag.id);
-            }
-            // `entry list -t a -t b` means entries must have both tags.
-            entries.retain(|e| tag_ids.iter().all(|tid| e.tag_ids.contains(tid)));
-        }
-        entries
-    };
+    let mut tag_ids = Vec::new();
+    for tag_ref in &tag_refs {
+        let tag = resolve_tag(store, tag_ref)?;
+        tag_ids.push(tag.id);
+    }
+    // `entry list -t a -t b` means entries must have both tags.
+    let archiver_filter = archiver
+        .as_deref()
+        .map(|name| if name.is_empty() { None } else { Some(name) });
+    let entries = store.find_entries(&tag_ids, archiver_filter)?;
 
     let names = tag_name_map(store)?;
     Ok(EntryResult::Listed { entries, names })
