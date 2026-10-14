@@ -183,11 +183,8 @@ impl SqliteCache {
         entries: &[Entry],
     ) -> Result<()> {
         if let Err(first_error) = self.rebuild_once(signature, tags, entries) {
-            self.invalidate();
             self.rebuild_once(signature, tags, entries)
-                .with_context(|| {
-                    format!("Failed to rebuild SQLite cache after: {first_error:#}")
-                })?;
+                .with_context(|| format!("Failed to rebuild SQLite cache after: {first_error:#}"))?;
         }
         Ok(())
     }
@@ -198,31 +195,59 @@ impl SqliteCache {
         tags: &[Tag],
         entries: &[Entry],
     ) -> Result<()> {
-        let mut connection = Connection::open(&self.path)
-            .with_context(|| format!("Failed to create cache {}", self.path.display()))?;
+        let temporary_path = self.temporary_path();
+        let result = self.rebuild_into(&temporary_path, signature, tags, entries);
+        if let Err(error) = result {
+            remove_sqlite_files(&temporary_path);
+            return Err(error);
+        }
+
+        if let Err(error) = std::fs::rename(&temporary_path, &self.path) {
+            remove_sqlite_files(&temporary_path);
+            return Err(error).with_context(|| {
+                format!(
+                    "Failed to replace cache {} with {}",
+                    self.path.display(),
+                    temporary_path.display()
+                )
+            });
+        }
+        remove_sqlite_sidecars(&self.path);
+        Ok(())
+    }
+
+    fn temporary_path(&self) -> PathBuf {
+        let mut path = self.path.as_os_str().to_os_string();
+        path.push(format!(".tmp-{}", uuid::Uuid::now_v7()));
+        PathBuf::from(path)
+    }
+
+    fn rebuild_into(
+        &self,
+        path: &Path,
+        signature: &SourceSignature,
+        tags: &[Tag],
+        entries: &[Entry],
+    ) -> Result<()> {
+        let mut connection = Connection::open(path)
+            .with_context(|| format!("Failed to create cache {}", path.display()))?;
         connection.execute_batch(
             "PRAGMA journal_mode = DELETE;
-             CREATE TABLE IF NOT EXISTS cache_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS tags (
+             CREATE TABLE cache_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE tags (
                  id TEXT PRIMARY KEY, name TEXT NOT NULL, specifier TEXT
              );
-             CREATE TABLE IF NOT EXISTS entries (
+             CREATE TABLE entries (
                  id TEXT PRIMARY KEY, ordinal INTEGER NOT NULL, url TEXT NOT NULL,
                  archiver TEXT, archive_path TEXT, description TEXT NOT NULL
              );
-             CREATE TABLE IF NOT EXISTS entry_tags (
+             CREATE TABLE entry_tags (
                  entry_id TEXT NOT NULL, ordinal INTEGER NOT NULL, tag_id TEXT NOT NULL,
                  PRIMARY KEY (entry_id, ordinal)
-             );
-             CREATE INDEX IF NOT EXISTS idx_entry_tags_tag_entry ON entry_tags(tag_id, entry_id);
-             CREATE INDEX IF NOT EXISTS idx_entries_archiver_ordinal ON entries(archiver, ordinal);",
+             );",
         )?;
 
         let transaction = connection.transaction()?;
-        transaction.execute("DELETE FROM entry_tags", [])?;
-        transaction.execute("DELETE FROM entries", [])?;
-        transaction.execute("DELETE FROM tags", [])?;
-        transaction.execute("DELETE FROM cache_meta", [])?;
         {
             let mut statement = transaction
                 .prepare("INSERT INTO tags (id, name, specifier) VALUES (?1, ?2, ?3)")?;
@@ -268,9 +293,26 @@ impl SqliteCache {
             "INSERT INTO cache_meta (key, value) VALUES ('entries_signature', ?1)",
             [&signature.entries],
         )?;
+        transaction.execute_batch(
+            "CREATE INDEX idx_entry_tags_tag_entry ON entry_tags(tag_id, entry_id);
+             CREATE INDEX idx_entries_archiver_ordinal ON entries(archiver, ordinal);",
+        )?;
         transaction.commit()?;
         Ok(())
     }
+}
+
+fn remove_sqlite_sidecars(path: &Path) {
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        let _ = std::fs::remove_file(PathBuf::from(sidecar));
+    }
+}
+
+fn remove_sqlite_files(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    remove_sqlite_sidecars(path);
 }
 
 fn read_meta(connection: &Connection, key: &str) -> Result<Option<String>> {
