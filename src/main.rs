@@ -1,19 +1,23 @@
-use std::collections::HashMap;
-
+mod application;
 mod archiver;
 mod config;
 mod domain;
 mod store;
 
-use anyhow::{bail, Context, Result};
+use std::collections::HashMap;
+
+use anyhow::Result;
+use application::{entry, tag};
 use clap::{Parser, Subcommand};
-use domain::{Entry, EntryId, Tag, TagId};
-use store::TomlStore;
-use archiver::ToolConfig;
 use config::{Config, TagConflictPolicy};
+use domain::{Entry, Tag, TagId};
+use store::TomlStore;
 
 #[derive(Parser)]
-#[command(name = "pantagraph", about = "Index the web through human-assigned tags")]
+#[command(
+    name = "pantagraph",
+    about = "Index the web through human-assigned tags"
+)]
 struct Cli {
     /// Path to data directory
     #[arg(long, default_value = "data", global = true)]
@@ -159,512 +163,6 @@ enum EntryCommands {
     },
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────
-
-/// Parse a tag reference string.
-///
-/// Supports:
-/// - `"name#N"` -> disambiguate by 1-based index (N)
-/// - `"name@specifier#N"` -> name + specifier + disambiguation index
-/// - `"name@specifier"` -> name + specifier
-/// - `"name"` -> plain name
-fn parse_tag_ref(input: &str) -> (&str, Option<&str>, Option<usize>) {
-    let (base, pick) = if let Some((base, suffix)) = input.rsplit_once('#') {
-        if let Ok(n) = suffix.parse::<usize>() {
-            if n >= 1 {
-                (base, Some(n))
-            } else {
-                (input, None)
-            }
-        } else {
-            (input, None)
-        }
-    } else {
-        (input, None)
-    };
-
-    if let Some((name, specifier)) = base.split_once('@') {
-        (name, Some(specifier), pick)
-    } else {
-        (base, None, pick)
-    }
-}
-
-/// Resolve a tag reference to a single Tag.
-///
-/// Accepted formats:
-/// - UUID string (exact ID lookup)
-/// - `name@specifier` (exact name/alias and specifier match)
-/// - Tag name (exact match; must be unique)
-/// - `name#N` or `name@specifier#N` (disambiguation: pick the Nth candidate, 1-indexed, sorted by UUID)
-fn resolve_tag(store: &TomlStore, name_or_id: &str) -> Result<Tag> {
-    // Try as UUID first
-    if let Ok(tag_id) = name_or_id.parse::<TagId>() {
-        if let Some(tag) = store.find_tag_by_id(&tag_id)? {
-            return Ok(tag);
-        }
-    }
-
-    // Parse name, optional @specifier, and optional #N
-    let (name, specifier, pick) = parse_tag_ref(name_or_id);
-
-    let mut tags = if let Some(spec) = specifier {
-        store.find_tags_by_name_and_specifier(name, spec)?
-    } else {
-        store.find_tags_by_name_or_alias(name)?
-    };
-    tags.sort_by_key(|t| t.id.0);
-
-    match (tags.len(), pick) {
-        (0, _) => bail!("Tag not found: {name_or_id}"),
-        (1, _) => Ok(tags.into_iter().next().unwrap()),
-        (_, Some(n)) => {
-            let count = tags.len();
-            tags.into_iter()
-                .nth(n - 1)
-                .with_context(|| format!("{name_or_id} is out of range (only {count} candidates)"))
-        }
-        (_, None) => {
-            eprintln!("Multiple tags match '{name_or_id}':");
-            for (i, tag) in tags.iter().enumerate() {
-                let alias_info = if tag.name != name && tag.aliases.iter().any(|a| a == name) {
-                    format!(" [{}]", tag.name)
-                } else {
-                    String::new()
-                };
-                let spec_info = if let Some(ref s) = tag.specifier {
-                    format!(" (@{s})")
-                } else {
-                    String::new()
-                };
-                if tag.description.is_empty() {
-                    eprintln!("  {name}#{}{spec_info}{alias_info}", i + 1);
-                } else {
-                    eprintln!("  {name}#{}{spec_info}{alias_info} {}", i + 1, tag.description);
-                }
-            }
-            bail!("Ambiguous tag name. Use {name_or_id}#N (or specify @specifier) to disambiguate.");
-        }
-    }
-}
-
-/// Build a TagId → display name lookup from all tags.
-fn tag_name_map(store: &TomlStore) -> Result<HashMap<TagId, String>> {
-    Ok(store
-        .list_tags()?
-        .into_iter()
-        .map(|t| (t.id, t.display_name()))
-        .collect())
-}
-
-// ── Display ─────────────────────────────────────────────────────────
-
-fn print_tag_short(tag: &Tag) {
-    let display_name = tag.display_name();
-    if tag.description.is_empty() {
-        println!("{}", display_name);
-    } else {
-        println!("{} — {}", display_name, tag.description);
-    }
-    println!("  id: {}", tag.id);
-    if let Some(ref spec) = tag.specifier {
-        println!("  specifier: @{}", spec);
-    }
-    if !tag.aliases.is_empty() {
-        println!("  aliases: {}", tag.aliases.join(", "));
-    }
-}
-
-fn print_entry_short(entry: &Entry, names: &HashMap<TagId, String>) {
-    let tag_labels: Vec<&str> = entry
-        .tag_ids
-        .iter()
-        .map(|id| names.get(id).map(|s| s.as_str()).unwrap_or("???"))
-        .collect();
-    let tags_str = if tag_labels.is_empty() {
-        String::from("(no tags)")
-    } else {
-        tag_labels.join(", ")
-    };
-    let archiver_badge = match &entry.archiver {
-        Some(a) if !a.is_empty() => format!("[{a}] "),
-        _ => String::new(),
-    };
-    println!("{}{entry_url}  [{tags_str}]", archiver_badge, entry_url = entry.url);
-    if let Some(archive_path) = &entry.archive_path {
-        println!("  archive: {}", archive_path);
-    }
-    if !entry.description.is_empty() {
-        println!("  {}", entry.description);
-    }
-    println!("  id: {}", entry.id);
-}
-
-fn handle_tag_create(
-    store: &TomlStore,
-    name: String,
-    mut specifier: Option<String>,
-    description: String,
-    aliases: Vec<String>,
-    policy: TagConflictPolicy,
-) -> Result<()> {
-    let name_trimmed = name.trim();
-    if name_trimmed.is_empty() {
-        bail!("Tag name cannot be empty");
-    }
-
-    // Support name@specifier in the positional name argument if -s wasn't provided
-    let (tag_name, parsed_spec) = if let Some((n, s)) = name_trimmed.split_once('@') {
-        (n.trim(), Some(s.trim()))
-    } else {
-        (name_trimmed, None)
-    };
-
-    if tag_name.is_empty() {
-        bail!("Tag name cannot be empty");
-    }
-
-    if specifier.is_none() && parsed_spec.is_some() {
-        let s = parsed_spec.unwrap();
-        if !s.is_empty() {
-            specifier = Some(s.to_string());
-        }
-    }
-
-    // Clean specifier
-    let clean_specifier = specifier.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-
-    let mut clean_aliases = Vec::new();
-    for a in aliases {
-        let a = a.trim();
-        if a.is_empty() {
-            continue;
-        }
-        if a == tag_name {
-            bail!("Alias cannot be identical to the tag name: '{a}'");
-        }
-        if !clean_aliases.contains(&a.to_string()) {
-            clean_aliases.push(a.to_string());
-        }
-    }
-
-    if policy != TagConflictPolicy::Ignore {
-        // If a specifier is provided, only tags with matching name/alias AND the exact same specifier conflict.
-        // If no specifier is provided, ANY existing tag with matching name/alias conflicts.
-        let conflicting_tags = if let Some(ref spec) = clean_specifier {
-            store.find_tags_by_name_and_specifier(tag_name, spec)?
-        } else {
-            store.find_tags_by_name_or_alias(tag_name)?
-        };
-
-        if !conflicting_tags.is_empty() {
-            let conflict_label = if let Some(ref s) = clean_specifier {
-                format!("{tag_name}@{s}")
-            } else {
-                tag_name.to_string()
-            };
-
-            match policy {
-                TagConflictPolicy::Abort => {
-                    eprintln!("Error: Tag conflict detected for '{conflict_label}'.");
-                    eprintln!("Existing matching tag(s):");
-                    for t in &conflicting_tags {
-                        let alias_str = if t.aliases.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" (aliases: {})", t.aliases.join(", "))
-                        };
-                        let spec_str = if let Some(ref s) = t.specifier {
-                            format!(" (@{s})")
-                        } else {
-                            String::new()
-                        };
-                        eprintln!("  - ID: {} | name: '{}{spec_str}{alias_str}'", t.id, t.name);
-                    }
-                    bail!("Aborted due to tag conflict for '{conflict_label}'.");
-                }
-                TagConflictPolicy::WarnOnly => {
-                    eprintln!("Warning: Tag conflict detected for '{conflict_label}'.");
-                    eprintln!("Existing matching tag(s):");
-                    for t in &conflicting_tags {
-                        let alias_str = if t.aliases.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" (aliases: {})", t.aliases.join(", "))
-                        };
-                        let spec_str = if let Some(ref s) = t.specifier {
-                            format!(" (@{s})")
-                        } else {
-                            String::new()
-                        };
-                        eprintln!("  - ID: {} | name: '{}{spec_str}{alias_str}'", t.id, t.name);
-                    }
-                }
-                TagConflictPolicy::Ignore => unreachable!(),
-            }
-        }
-    }
-
-    let tag = Tag::with_specifier(tag_name, clean_specifier, description, clean_aliases);
-    let tag = store.create_tag(tag)?;
-    println!("Created tag:");
-    print_tag_short(&tag);
-    Ok(())
-}
-
-fn handle_tag_list(store: &TomlStore, name_filter: Option<String>) -> Result<()> {
-    let tags: Vec<Tag> = if let Some(ref filter) = name_filter {
-        store
-            .list_tags()?
-            .into_iter()
-            .filter(|t| {
-                t.name.contains(filter.as_str())
-                    || t.aliases.iter().any(|a| a.contains(filter.as_str()))
-            })
-            .collect()
-    } else {
-        store.list_tags()?
-    };
-
-    if tags.is_empty() {
-        println!("No tags found.");
-    } else {
-        for tag in &tags {
-            print_tag_short(tag);
-        }
-    }
-    Ok(())
-}
-
-fn handle_tag_show(store: &TomlStore, name_or_id: String) -> Result<()> {
-    let tag = resolve_tag(store, &name_or_id)?;
-    println!("Tag:         {}", tag.name);
-    println!("ID:          {}", tag.id);
-    if let Some(ref spec) = tag.specifier {
-        println!("Specifier:   @{}", spec);
-    }
-    println!(
-        "Aliases:     {}",
-        if tag.aliases.is_empty() {
-            "(none)".to_string()
-        } else {
-            tag.aliases.join(", ")
-        }
-    );
-    println!(
-        "Description: {}",
-        if tag.description.is_empty() {
-            "(none)"
-        } else {
-            &tag.description
-        }
-    );
-
-    // Show entries with this tag
-    let entries = store.find_entries_by_tag(&tag.id)?;
-    if !entries.is_empty() {
-        println!("\nEntries ({}):", entries.len());
-        for entry in &entries {
-            let archiver_badge = match &entry.archiver {
-                Some(a) if !a.is_empty() => format!("[{a}] "),
-                _ => String::new(),
-            };
-            println!("  {}{}", archiver_badge, entry.url);
-        }
-    }
-    Ok(())
-}
-
-fn handle_tag_rename(store: &TomlStore, name_or_id: String, new_name: String) -> Result<()> {
-    let new_name = new_name.trim();
-    if new_name.is_empty() {
-        bail!("Tag name cannot be empty");
-    }
-    let tag = resolve_tag(store, &name_or_id)?;
-    let old_name = tag.name.clone();
-    let updated = store.rename_tag(&tag.id, new_name)?;
-    println!("Renamed tag '{}' to '{}':", old_name, updated.name);
-    print_tag_short(&updated);
-    Ok(())
-}
-
-fn handle_tag_alias_add(store: &TomlStore, name_or_id: String, alias: String) -> Result<()> {
-    let tag = resolve_tag(store, &name_or_id)?;
-    let updated = store.add_tag_alias(&tag.id, &alias)?;
-    println!("Added alias '{}' to tag '{}':", alias.trim(), updated.name);
-    print_tag_short(&updated);
-    Ok(())
-}
-
-fn handle_tag_alias_remove(store: &TomlStore, name_or_id: String, alias: String) -> Result<()> {
-    let tag = resolve_tag(store, &name_or_id)?;
-    let updated = store.remove_tag_alias(&tag.id, &alias)?;
-    println!(
-        "Removed alias '{}' from tag '{}':",
-        alias.trim(),
-        updated.name
-    );
-    print_tag_short(&updated);
-    Ok(())
-}
-
-fn handle_tag_alias_list(store: &TomlStore, name_or_id: String) -> Result<()> {
-    let tag = resolve_tag(store, &name_or_id)?;
-    if tag.aliases.is_empty() {
-        println!("No aliases for tag '{}'.", tag.name);
-    } else {
-        println!("Aliases for tag '{}':", tag.name);
-        for alias in &tag.aliases {
-            println!("  {alias}");
-        }
-    }
-    Ok(())
-}
-
-fn handle_entry_add(
-    store: &TomlStore,
-    archiver: String,
-    url: String,
-    description: String,
-    tag_refs: Vec<String>,
-) -> Result<()> {
-    let mut tag_ids = Vec::new();
-    for tag_ref in &tag_refs {
-        let tag = resolve_tag(store, tag_ref)?;
-        tag_ids.push(tag.id);
-    }
-
-    let entry_id = EntryId::new();
-
-    let (archiver_opt, archive_path_opt) = if archiver.trim().is_empty() {
-        (None, None)
-    } else {
-        let archiver_name = archiver.trim();
-        let tool_config = ToolConfig::load_from_dir(store.data_dir())?;
-
-        // Entry-specific archive directory: <data_dir>/archives/<entry_id>/
-        let outdir = store.data_dir().join("archives").join(entry_id.to_string());
-        std::fs::create_dir_all(&outdir)
-            .with_context(|| format!("Failed to create directory {}", outdir.display()))?;
-
-        println!("Archiving with '{}'...", archiver_name);
-        tool_config.execute_archiver(archiver_name, &url, &outdir)?;
-
-        let relative_path = format!("archives/{entry_id}");
-        (Some(archiver_name.to_string()), Some(relative_path))
-    };
-
-    let mut entry = Entry::new(
-        &url,
-        archiver_opt,
-        archive_path_opt,
-        &description,
-        tag_ids,
-    );
-    entry.id = entry_id;
-
-    let entry = store.create_entry(entry)?;
-    let names = tag_name_map(store)?;
-    println!("Created entry:");
-    print_entry_short(&entry, &names);
-    Ok(())
-}
-
-fn handle_entry_list(
-    store: &TomlStore,
-    archiver: Option<String>,
-    tag_refs: Vec<String>,
-) -> Result<()> {
-    let entries: Vec<Entry> = {
-        let mut entries = store.list_entries()?;
-        if let Some(target_archiver) = archiver {
-            if target_archiver.is_empty() {
-                entries.retain(|e| e.archiver.is_none());
-            } else {
-                entries.retain(|e| e.archiver.as_deref() == Some(&target_archiver));
-            }
-        }
-        if !tag_refs.is_empty() {
-            let mut tag_ids = Vec::new();
-            for tag_ref in &tag_refs {
-                let tag = resolve_tag(store, tag_ref)?;
-                tag_ids.push(tag.id);
-            }
-            entries.retain(|e| tag_ids.iter().all(|tid| e.tag_ids.contains(tid)));
-        }
-        entries
-    };
-
-    let names = tag_name_map(store)?;
-    if entries.is_empty() {
-        println!("No entries found.");
-    } else {
-        for entry in &entries {
-            print_entry_short(entry, &names);
-        }
-    }
-    Ok(())
-}
-
-fn handle_entry_show(store: &TomlStore, id: String) -> Result<()> {
-    let entry_id: EntryId = id.parse().context("Invalid entry ID")?;
-    let entry = store
-        .find_entry_by_id(&entry_id)?
-        .context("Entry not found")?;
-    let names = tag_name_map(store)?;
-
-    println!("URL:         {}", entry.url);
-    println!("ID:          {}", entry.id);
-    if let Some(ref archiver) = entry.archiver {
-        println!("Archiver:    {}", archiver);
-    }
-    if let Some(ref archive_path) = entry.archive_path {
-        println!("Archive:     {}", archive_path);
-    }
-    println!(
-        "Description: {}",
-        if entry.description.is_empty() {
-            "(none)"
-        } else {
-            &entry.description
-        }
-    );
-
-    let tag_labels: Vec<String> = entry
-        .tag_ids
-        .iter()
-        .map(|id| {
-            names
-                .get(id)
-                .cloned()
-                .unwrap_or_else(|| format!("(unknown: {})", id))
-        })
-        .collect();
-    println!(
-        "Tags:        {}",
-        if tag_labels.is_empty() {
-            "(none)".to_string()
-        } else {
-            tag_labels.join(", ")
-        }
-    );
-    Ok(())
-}
-
-fn handle_entry_tag(store: &TomlStore, entry_id: String, tag_ref: String) -> Result<()> {
-    let eid: EntryId = entry_id.parse().context("Invalid entry ID")?;
-    let tag = resolve_tag(store, &tag_ref)?;
-
-    // Verify entry exists
-    store
-        .find_entry_by_id(&eid)?
-        .context("Entry not found")?;
-
-    store.add_tag_to_entry(&eid, &tag.id)?;
-    println!("Added tag '{}' to entry {}", tag.name, eid);
-    Ok(())
-}
-
 // ── Main ────────────────────────────────────────────────────────────
 
 fn run() -> Result<()> {
@@ -682,30 +180,35 @@ fn run() -> Result<()> {
                 on_conflict,
             } => {
                 let policy = on_conflict.unwrap_or(config.tag.conflict_resolution);
-                handle_tag_create(&store, name, specifier, description, alias, policy)
+                tag::handle_tag_create(&store, name, specifier, description, alias, policy)
+                    .map(present_tag_result)
             }
-            TagCommands::List { name } => handle_tag_list(&store, name),
-            TagCommands::Show { name_or_id } => handle_tag_show(&store, name_or_id),
+            TagCommands::List { name } => {
+                tag::handle_tag_list(&store, name).map(present_tag_result)
+            }
+            TagCommands::Show { name_or_id } => {
+                tag::handle_tag_show(&store, name_or_id).map(present_tag_result)
+            }
             TagCommands::Rename {
                 name_or_id,
                 new_name,
-            } => handle_tag_rename(&store, name_or_id, new_name),
+            } => tag::handle_tag_rename(&store, name_or_id, new_name).map(present_tag_result),
             TagCommands::Alias { command } => match command {
                 TagAliasCommands::Add { name_or_id, alias } => {
-                    handle_tag_alias_add(&store, name_or_id, alias)
+                    tag::handle_tag_alias_add(&store, name_or_id, alias).map(present_tag_result)
                 }
                 TagAliasCommands::Remove { name_or_id, alias } => {
-                    handle_tag_alias_remove(&store, name_or_id, alias)
+                    tag::handle_tag_alias_remove(&store, name_or_id, alias).map(present_tag_result)
                 }
                 TagAliasCommands::List { name_or_id } => {
-                    handle_tag_alias_list(&store, name_or_id)
+                    tag::handle_tag_alias_list(&store, name_or_id).map(present_tag_result)
                 }
             },
             TagCommands::AddAlias { name_or_id, alias } => {
-                handle_tag_alias_add(&store, name_or_id, alias)
+                tag::handle_tag_alias_add(&store, name_or_id, alias).map(present_tag_result)
             }
             TagCommands::RemoveAlias { name_or_id, alias } => {
-                handle_tag_alias_remove(&store, name_or_id, alias)
+                tag::handle_tag_alias_remove(&store, name_or_id, alias).map(present_tag_result)
             }
         },
         Commands::Entry { command } => match command {
@@ -714,18 +217,234 @@ fn run() -> Result<()> {
                 url,
                 description,
                 tag,
-            } => handle_entry_add(&store, archiver, url, description, tag),
+            } => entry::handle_entry_add(&store, archiver, url, description, tag)
+                .map(present_entry_result),
             EntryCommands::List { archiver, tag } => {
-                handle_entry_list(&store, archiver, tag)
+                entry::handle_entry_list(&store, archiver, tag).map(present_entry_result)
             }
-            EntryCommands::Show { id } => handle_entry_show(&store, id),
-            EntryCommands::Tag { entry_id, tag } => handle_entry_tag(&store, entry_id, tag),
+            EntryCommands::Show { id } => {
+                entry::handle_entry_show(&store, id).map(present_entry_result)
+            }
+            EntryCommands::Tag { entry_id, tag } => {
+                entry::handle_entry_tag(&store, entry_id, tag).map(present_entry_result)
+            }
         },
     }
 }
 
+fn present_tag_result(result: tag::TagResult) {
+    use tag::TagResult::*;
+    match result {
+        Created { tag, conflicts } => {
+            if !conflicts.is_empty() {
+                print_conflicts("Warning", &tag.display_name(), &conflicts);
+            }
+            println!("Created tag:");
+            print_tag_short(&tag);
+        }
+        Listed(tags) => {
+            if tags.is_empty() {
+                println!("No tags found.");
+            } else {
+                for tag in &tags {
+                    print_tag_short(tag);
+                }
+            }
+        }
+        Show { tag, entries } => {
+            println!("Tag:         {}", tag.name);
+            println!("ID:          {}", tag.id);
+            if let Some(spec) = &tag.specifier {
+                println!("Specifier:   @{spec}");
+            }
+            println!(
+                "Aliases:     {}",
+                if tag.aliases.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    tag.aliases.join(", ")
+                }
+            );
+            println!(
+                "Description: {}",
+                if tag.description.is_empty() {
+                    "(none)"
+                } else {
+                    &tag.description
+                }
+            );
+            if !entries.is_empty() {
+                println!("\nEntries ({}):", entries.len());
+                for entry in entries {
+                    println!(
+                        "  {}{}",
+                        entry
+                            .archiver
+                            .as_ref()
+                            .filter(|a| !a.is_empty())
+                            .map(|a| format!("[{a}] "))
+                            .unwrap_or_default(),
+                        entry.url
+                    );
+                }
+            }
+        }
+        Renamed { old_name, tag } => {
+            println!("Renamed tag '{}' to '{}':", old_name, tag.name);
+            print_tag_short(&tag);
+        }
+        AliasAdded { alias, tag } => {
+            println!("Added alias '{}' to tag '{}':", alias, tag.name);
+            print_tag_short(&tag);
+        }
+        AliasRemoved { alias, tag } => {
+            println!("Removed alias '{}' from tag '{}':", alias, tag.name);
+            print_tag_short(&tag);
+        }
+        AliasList(tag) => {
+            if tag.aliases.is_empty() {
+                println!("No aliases for tag '{}'.", tag.name);
+            } else {
+                println!("Aliases for tag '{}':", tag.name);
+                for alias in tag.aliases {
+                    println!("  {alias}");
+                }
+            }
+        }
+    }
+}
+
+fn present_entry_result(result: entry::EntryResult) {
+    use entry::EntryResult::*;
+    match result {
+        Added {
+            entry,
+            names,
+            archiver,
+        } => {
+            if let Some(name) = archiver {
+                println!("Archiving with '{}'...", name);
+            }
+            println!("Created entry:");
+            print_entry_short(&entry, &names);
+        }
+        Listed { entries, names } => {
+            if entries.is_empty() {
+                println!("No entries found.");
+            } else {
+                for entry in &entries {
+                    print_entry_short(entry, &names);
+                }
+            }
+        }
+        Show { entry, names } => {
+            println!("URL:         {}", entry.url);
+            println!("ID:          {}", entry.id);
+            if let Some(archiver) = &entry.archiver {
+                println!("Archiver:    {archiver}");
+            }
+            if let Some(path) = &entry.archive_path {
+                println!("Archive:     {path}");
+            }
+            println!(
+                "Description: {}",
+                if entry.description.is_empty() {
+                    "(none)"
+                } else {
+                    &entry.description
+                }
+            );
+            let labels = entry
+                .tag_ids
+                .iter()
+                .map(|id| {
+                    names
+                        .get(id)
+                        .cloned()
+                        .unwrap_or_else(|| format!("(unknown: {id})"))
+                })
+                .collect::<Vec<_>>();
+            println!(
+                "Tags:        {}",
+                if labels.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    labels.join(", ")
+                }
+            );
+        }
+        Tagged { entry_id, tag_name } => println!("Added tag '{}' to entry {}", tag_name, entry_id),
+    }
+}
+
+fn print_conflicts(prefix: &str, label: &str, tags: &[Tag]) {
+    eprintln!("{prefix}: Tag conflict detected for '{label}'.");
+    eprintln!("Existing matching tag(s):");
+    for tag in tags {
+        let aliases = if tag.aliases.is_empty() {
+            String::new()
+        } else {
+            format!(" (aliases: {})", tag.aliases.join(", "))
+        };
+        let specifier = tag
+            .specifier
+            .as_ref()
+            .map(|s| format!(" (@{s})"))
+            .unwrap_or_default();
+        eprintln!(
+            "  - ID: {} | name: '{}{specifier}{aliases}'",
+            tag.id, tag.name
+        );
+    }
+}
+
+fn print_tag_short(tag: &Tag) {
+    if tag.description.is_empty() {
+        println!("{}", tag.display_name());
+    } else {
+        println!("{} — {}", tag.display_name(), tag.description);
+    }
+    println!("  id: {}", tag.id);
+    if let Some(specifier) = &tag.specifier {
+        println!("  specifier: @{specifier}");
+    }
+    if !tag.aliases.is_empty() {
+        println!("  aliases: {}", tag.aliases.join(", "));
+    }
+}
+
+fn print_entry_short(entry: &Entry, names: &HashMap<TagId, String>) {
+    let tags = entry
+        .tag_ids
+        .iter()
+        .map(|id| names.get(id).map(String::as_str).unwrap_or("???"))
+        .collect::<Vec<_>>();
+    let tags = if tags.is_empty() {
+        "(no tags)".to_string()
+    } else {
+        tags.join(", ")
+    };
+    let badge = entry
+        .archiver
+        .as_ref()
+        .filter(|a| !a.is_empty())
+        .map(|a| format!("[{a}] "))
+        .unwrap_or_default();
+    println!("{badge}{}  [{tags}]", entry.url);
+    if let Some(path) = &entry.archive_path {
+        println!("  archive: {path}");
+    }
+    if !entry.description.is_empty() {
+        println!("  {}", entry.description);
+    }
+    println!("  id: {}", entry.id);
+}
+
 fn main() {
     if let Err(e) = run() {
+        if let Some(conflict) = e.downcast_ref::<tag::TagConflictAbort>() {
+            print_conflicts("Error", &conflict.label, &conflict.tags);
+        }
         eprintln!("Error: {e:#}");
         std::process::exit(1);
     }
@@ -734,59 +453,79 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::Tag;
 
     #[test]
     fn test_parse_tag_ref() {
-        assert_eq!(parse_tag_ref("rust"), ("rust", None, None));
-        assert_eq!(parse_tag_ref("rust#1"), ("rust", None, Some(1)));
-        assert_eq!(parse_tag_ref("rust#2"), ("rust", None, Some(2)));
-        assert_eq!(parse_tag_ref("rust#0"), ("rust#0", None, None));
-        assert_eq!(parse_tag_ref("rust#abc"), ("rust#abc", None, None));
-        assert_eq!(parse_tag_ref("rust@lang"), ("rust", Some("lang"), None));
-        assert_eq!(parse_tag_ref("rust@game#1"), ("rust", Some("game"), Some(1)));
+        assert_eq!(tag::parse_tag_ref("rust"), ("rust", None, None));
+        assert_eq!(tag::parse_tag_ref("rust#1"), ("rust", None, Some(1)));
+        assert_eq!(tag::parse_tag_ref("rust#2"), ("rust", None, Some(2)));
+        assert_eq!(tag::parse_tag_ref("rust#0"), ("rust#0", None, None));
+        assert_eq!(tag::parse_tag_ref("rust#abc"), ("rust#abc", None, None));
+        assert_eq!(
+            tag::parse_tag_ref("rust@lang"),
+            ("rust", Some("lang"), None)
+        );
+        assert_eq!(
+            tag::parse_tag_ref("rust@game#1"),
+            ("rust", Some("game"), Some(1))
+        );
     }
 
     #[test]
     fn test_handle_tag_rename() {
-        let dir = std::env::temp_dir().join(format!("pantagraph_test_main_{}", uuid::Uuid::now_v7()));
+        let dir =
+            std::env::temp_dir().join(format!("pantagraph_test_main_{}", uuid::Uuid::now_v7()));
         let store = TomlStore::new(&dir).unwrap();
         let tag = store.create_tag(Tag::new("old-tag", "desc")).unwrap();
 
         // Rename via name
-        assert!(handle_tag_rename(&store, "old-tag".to_string(), "new-tag".to_string()).is_ok());
+        assert!(
+            tag::handle_tag_rename(&store, "old-tag".to_string(), "new-tag".to_string()).is_ok()
+        );
         let updated = store.find_tag_by_id(&tag.id).unwrap().unwrap();
         assert_eq!(updated.name, "new-tag");
 
         // Rename via UUID
-        assert!(handle_tag_rename(&store, tag.id.to_string(), "uuid-renamed".to_string()).is_ok());
+        assert!(
+            tag::handle_tag_rename(&store, tag.id.to_string(), "uuid-renamed".to_string()).is_ok()
+        );
         let updated2 = store.find_tag_by_id(&tag.id).unwrap().unwrap();
         assert_eq!(updated2.name, "uuid-renamed");
 
         // Disallow empty name
-        assert!(handle_tag_rename(&store, "uuid-renamed".to_string(), "   ".to_string()).is_err());
+        assert!(
+            tag::handle_tag_rename(&store, "uuid-renamed".to_string(), "   ".to_string()).is_err()
+        );
 
         // Error if not found
-        assert!(handle_tag_rename(&store, "non-existent".to_string(), "valid".to_string()).is_err());
+        assert!(
+            tag::handle_tag_rename(&store, "non-existent".to_string(), "valid".to_string())
+                .is_err()
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn test_handle_tag_rename_disambiguation() {
-        let dir = std::env::temp_dir().join(format!("pantagraph_test_disambig_{}", uuid::Uuid::now_v7()));
+        let dir =
+            std::env::temp_dir().join(format!("pantagraph_test_disambig_{}", uuid::Uuid::now_v7()));
         let store = TomlStore::new(&dir).unwrap();
         let tag1 = store.create_tag(Tag::new("dupe", "first")).unwrap();
         let tag2 = store.create_tag(Tag::new("dupe", "second")).unwrap();
 
         // Ambiguous rename should fail without #N
-        assert!(handle_tag_rename(&store, "dupe".to_string(), "renamed".to_string()).is_err());
+        assert!(tag::handle_tag_rename(&store, "dupe".to_string(), "renamed".to_string()).is_err());
 
         // Disambiguated rename should succeed
         // Sorted by UUID order
         let mut expected_order = [tag1.id, tag2.id];
         expected_order.sort_by_key(|id| id.0);
 
-        assert!(handle_tag_rename(&store, "dupe#1".to_string(), "renamed-1".to_string()).is_ok());
+        assert!(
+            tag::handle_tag_rename(&store, "dupe#1".to_string(), "renamed-1".to_string()).is_ok()
+        );
         let first_updated = store.find_tag_by_id(&expected_order[0]).unwrap().unwrap();
         assert_eq!(first_updated.name, "renamed-1");
 
@@ -798,98 +537,125 @@ mod tests {
 
     #[test]
     fn test_tag_alias_and_entry_integration() {
-        let dir = std::env::temp_dir().join(format!("pantagraph_test_alias_int_{}", uuid::Uuid::now_v7()));
+        let dir = std::env::temp_dir().join(format!(
+            "pantagraph_test_alias_int_{}",
+            uuid::Uuid::now_v7()
+        ));
         let store = TomlStore::new(&dir).unwrap();
 
         // 1. Create tag with aliases
-        assert!(handle_tag_create(
+        assert!(tag::handle_tag_create(
             &store,
             "rust".to_string(),
             None,
             "Rust programming language".to_string(),
             vec!["rs".to_string(), "rust-lang".to_string()],
             TagConflictPolicy::Abort,
-        ).is_ok());
+        )
+        .is_ok());
 
         // 2. Resolve by alias
-        let resolved = resolve_tag(&store, "rs").unwrap();
+        let resolved = tag::resolve_tag(&store, "rs").unwrap();
         assert_eq!(resolved.name, "rust");
 
-        let resolved_alias2 = resolve_tag(&store, "rust-lang").unwrap();
+        let resolved_alias2 = tag::resolve_tag(&store, "rust-lang").unwrap();
         assert_eq!(resolved_alias2.id, resolved.id);
 
         // 3. Add entry using alias
-        assert!(handle_entry_add(
+        assert!(entry::handle_entry_add(
             &store,
             "".to_string(),
             "https://www.rust-lang.org".to_string(),
             "Rust website".to_string(),
             vec!["rs".to_string()]
-        ).is_ok());
+        )
+        .is_ok());
 
         let entries = store.list_entries().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].tag_ids, vec![resolved.id]);
 
         // 4. Filter entries by alias
-        assert!(handle_entry_list(&store, None, vec!["rust-lang".to_string()]).is_ok());
+        assert!(entry::handle_entry_list(&store, None, vec!["rust-lang".to_string()]).is_ok());
 
         // 5. Add another tag and attach via alias using handle_entry_tag
-        assert!(handle_tag_create(
+        assert!(tag::handle_tag_create(
             &store,
             "systems".to_string(),
             None,
             "".to_string(),
             vec!["sys".to_string()],
             TagConflictPolicy::Abort,
-        ).is_ok());
+        )
+        .is_ok());
 
-        assert!(handle_entry_tag(&store, entries[0].id.to_string(), "sys".to_string()).is_ok());
+        assert!(
+            entry::handle_entry_tag(&store, entries[0].id.to_string(), "sys".to_string()).is_ok()
+        );
         let updated_entry = store.find_entry_by_id(&entries[0].id).unwrap().unwrap();
         assert_eq!(updated_entry.tag_ids.len(), 2);
 
         // 6. Rename tag referenced by alias
-        assert!(handle_tag_rename(&store, "rs".to_string(), "rustacean".to_string()).is_ok());
-        let renamed = resolve_tag(&store, "rs").unwrap();
+        assert!(tag::handle_tag_rename(&store, "rs".to_string(), "rustacean".to_string()).is_ok());
+        let renamed = tag::resolve_tag(&store, "rs").unwrap();
         assert_eq!(renamed.name, "rustacean");
 
         // 7. Add & remove alias via CLI handler
-        assert!(handle_tag_alias_add(&store, "rustacean".to_string(), "crab".to_string()).is_ok());
-        let with_crab = resolve_tag(&store, "crab").unwrap();
+        assert!(
+            tag::handle_tag_alias_add(&store, "rustacean".to_string(), "crab".to_string()).is_ok()
+        );
+        let with_crab = tag::resolve_tag(&store, "crab").unwrap();
         assert_eq!(with_crab.name, "rustacean");
 
-        assert!(handle_tag_alias_list(&store, "crab".to_string()).is_ok());
+        assert!(tag::handle_tag_alias_list(&store, "crab".to_string()).is_ok());
 
-        assert!(handle_tag_alias_remove(&store, "crab".to_string(), "crab".to_string()).is_ok());
-        assert!(resolve_tag(&store, "crab").is_err());
+        assert!(
+            tag::handle_tag_alias_remove(&store, "crab".to_string(), "crab".to_string()).is_ok()
+        );
+        assert!(tag::resolve_tag(&store, "crab").is_err());
 
         // 8. Tag show works with alias
-        assert!(handle_tag_show(&store, "rs".to_string()).is_ok());
+        assert!(tag::handle_tag_show(&store, "rs".to_string()).is_ok());
 
         // 9. Tag list filter matches alias
-        assert!(handle_tag_list(&store, Some("rust-lan".to_string())).is_ok());
+        assert!(tag::handle_tag_list(&store, Some("rust-lan".to_string())).is_ok());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn test_tag_alias_disambiguation() {
-        let dir = std::env::temp_dir().join(format!("pantagraph_test_alias_dis_{}", uuid::Uuid::now_v7()));
+        let dir = std::env::temp_dir().join(format!(
+            "pantagraph_test_alias_dis_{}",
+            uuid::Uuid::now_v7()
+        ));
         let store = TomlStore::new(&dir).unwrap();
 
-        let tag1 = store.create_tag(Tag::with_aliases("first", "first tag", vec!["common".to_string()])).unwrap();
-        let tag2 = store.create_tag(Tag::with_aliases("second", "second tag", vec!["common".to_string()])).unwrap();
+        let tag1 = store
+            .create_tag(Tag::with_aliases(
+                "first",
+                "first tag",
+                vec!["common".to_string()],
+            ))
+            .unwrap();
+        let tag2 = store
+            .create_tag(Tag::with_aliases(
+                "second",
+                "second tag",
+                vec!["common".to_string()],
+            ))
+            .unwrap();
 
         // Ambiguous without #N
-        assert!(resolve_tag(&store, "common").is_err());
+        assert!(tag::resolve_tag(&store, "common").is_err());
 
         let mut expected = [tag1.id, tag2.id];
         expected.sort_by_key(|id| id.0);
 
-        let picked1 = resolve_tag(&store, "common#1").unwrap();
+        let picked1 = tag::resolve_tag(&store, "common#1").unwrap();
         assert_eq!(picked1.id, expected[0]);
 
-        let picked2 = resolve_tag(&store, "common#2").unwrap();
+        let picked2 = tag::resolve_tag(&store, "common#2").unwrap();
         assert_eq!(picked2.id, expected[1]);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -897,14 +663,17 @@ mod tests {
 
     #[test]
     fn test_tag_create_conflict_policies() {
-        let dir = std::env::temp_dir().join(format!("pantagraph_test_conflict_{}", uuid::Uuid::now_v7()));
+        let dir =
+            std::env::temp_dir().join(format!("pantagraph_test_conflict_{}", uuid::Uuid::now_v7()));
         let store = TomlStore::new(&dir).unwrap();
 
         // Initial tag
-        store.create_tag(Tag::with_aliases("alpha", "desc", vec!["al".to_string()])).unwrap();
+        store
+            .create_tag(Tag::with_aliases("alpha", "desc", vec!["al".to_string()]))
+            .unwrap();
 
         // 1. Conflict on name with TagConflictPolicy::Abort -> err
-        let res_abort = handle_tag_create(
+        let res_abort = tag::handle_tag_create(
             &store,
             "alpha".to_string(),
             None,
@@ -915,7 +684,7 @@ mod tests {
         assert!(res_abort.is_err());
 
         // 2. Conflict on alias with TagConflictPolicy::Abort -> err
-        let res_alias_abort = handle_tag_create(
+        let res_alias_abort = tag::handle_tag_create(
             &store,
             "al".to_string(),
             None,
@@ -926,7 +695,7 @@ mod tests {
         assert!(res_alias_abort.is_err());
 
         // 3. Conflict with TagConflictPolicy::WarnOnly -> succeeds and warns
-        let res_warn = handle_tag_create(
+        let res_warn = tag::handle_tag_create(
             &store,
             "alpha".to_string(),
             None,
@@ -937,7 +706,7 @@ mod tests {
         assert!(res_warn.is_ok());
 
         // 4. Conflict with TagConflictPolicy::Ignore -> succeeds
-        let res_ignore = handle_tag_create(
+        let res_ignore = tag::handle_tag_create(
             &store,
             "alpha".to_string(),
             None,
@@ -956,87 +725,96 @@ mod tests {
 
     #[test]
     fn test_tag_specifier_resolution() {
-        let dir = std::env::temp_dir().join(format!("pantagraph_test_specifier_{}", uuid::Uuid::now_v7()));
+        let dir = std::env::temp_dir().join(format!(
+            "pantagraph_test_specifier_{}",
+            uuid::Uuid::now_v7()
+        ));
         let store = TomlStore::new(&dir).unwrap();
 
         // Create two tags with same name "rust", but different specifiers
-        assert!(handle_tag_create(
+        assert!(tag::handle_tag_create(
             &store,
             "rust@lang".to_string(),
             None,
             "Rust language".to_string(),
             vec!["rs".to_string()],
             TagConflictPolicy::Ignore,
-        ).is_ok());
+        )
+        .is_ok());
 
-        assert!(handle_tag_create(
+        assert!(tag::handle_tag_create(
             &store,
             "rust".to_string(),
             Some("game".to_string()),
             "Rust video game".to_string(),
             vec![],
             TagConflictPolicy::Ignore,
-        ).is_ok());
+        )
+        .is_ok());
 
         // Bare "rust" is ambiguous
-        assert!(resolve_tag(&store, "rust").is_err());
+        assert!(tag::resolve_tag(&store, "rust").is_err());
 
         // "rust@lang" resolves to the programming language tag
-        let lang_tag = resolve_tag(&store, "rust@lang").unwrap();
+        let lang_tag = tag::resolve_tag(&store, "rust@lang").unwrap();
         assert_eq!(lang_tag.name, "rust");
         assert_eq!(lang_tag.specifier, Some("lang".to_string()));
         assert_eq!(lang_tag.display_name(), "rust@lang");
 
         // "rust@game" resolves to the video game tag
-        let game_tag = resolve_tag(&store, "rust@game").unwrap();
+        let game_tag = tag::resolve_tag(&store, "rust@game").unwrap();
         assert_eq!(game_tag.name, "rust");
         assert_eq!(game_tag.specifier, Some("game".to_string()));
         assert_eq!(game_tag.display_name(), "rust@game");
 
         // Alias "rs@lang" also resolves correctly
-        let alias_spec = resolve_tag(&store, "rs@lang").unwrap();
+        let alias_spec = tag::resolve_tag(&store, "rs@lang").unwrap();
         assert_eq!(alias_spec.id, lang_tag.id);
 
         // When rust@lang and rust@game exist:
         // 1. Adding "rust@editor" with TagConflictPolicy::Abort passes without error (no conflict on rust@editor)
-        assert!(handle_tag_create(
+        assert!(tag::handle_tag_create(
             &store,
             "rust@editor".to_string(),
             None,
             "Rust editor".to_string(),
             vec![],
             TagConflictPolicy::Abort,
-        ).is_ok());
+        )
+        .is_ok());
 
         // 2. Adding "rust@lang" again with TagConflictPolicy::Abort fails (conflict on rust@lang)
-        assert!(handle_tag_create(
+        assert!(tag::handle_tag_create(
             &store,
             "rust@lang".to_string(),
             None,
             "Rust lang duplicate".to_string(),
             vec![],
             TagConflictPolicy::Abort,
-        ).is_err());
+        )
+        .is_err());
 
         // 3. Adding bare "rust" without specifier with TagConflictPolicy::Abort fails (conflicts with existing "rust" tags)
-        assert!(handle_tag_create(
+        assert!(tag::handle_tag_create(
             &store,
             "rust".to_string(),
             None,
             "Bare rust".to_string(),
             vec![],
             TagConflictPolicy::Abort,
-        ).is_err());
+        )
+        .is_err());
 
         // 4. Adding bare "rust" with TagConflictPolicy::WarnOnly succeeds
-        assert!(handle_tag_create(
+        assert!(tag::handle_tag_create(
             &store,
             "rust".to_string(),
             None,
             "Bare rust".to_string(),
             vec![],
             TagConflictPolicy::WarnOnly,
-        ).is_ok());
+        )
+        .is_ok());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
