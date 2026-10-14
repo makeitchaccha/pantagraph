@@ -1,26 +1,36 @@
 use anyhow::{Context, Result};
-use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum TagConflictPolicy {
-    /// Disallow conflict: abort immediately when conflict is detected.
-    Abort,
-    /// Warn on conflict: print warning to stderr and continue creating the tag.
+pub enum DuplicatePolicy {
     #[default]
-    #[value(name = "warn-only", alias = "warn_only")]
-    WarnOnly,
-    /// Completely ignore conflict without warnings.
-    Ignore,
+    Allow,
+    Warn,
+    Error,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TagConfig {
     #[serde(default)]
-    pub conflict_resolution: TagConflictPolicy,
+    pub same_name_policy: DuplicatePolicy,
+    #[serde(default = "default_same_qualified_ref_policy")]
+    pub same_qualified_ref_policy: DuplicatePolicy,
+}
+
+fn default_same_qualified_ref_policy() -> DuplicatePolicy {
+    DuplicatePolicy::Error
+}
+
+impl Default for TagConfig {
+    fn default() -> Self {
+        Self {
+            same_name_policy: DuplicatePolicy::Allow,
+            same_qualified_ref_policy: DuplicatePolicy::Error,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -57,26 +67,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_config() {
-        let toml_str = r#"
-        [tag]
-        conflict_resolution = "abort"
-        "#;
-        let cfg: Config = toml::from_str(toml_str).unwrap();
-        assert_eq!(cfg.tag.conflict_resolution, TagConflictPolicy::Abort);
+    fn defaults_allow_duplicate_names_and_error_on_duplicate_qualified_refs() {
+        let cfg = Config::default();
+        assert_eq!(cfg.tag.same_name_policy, DuplicatePolicy::Allow);
+        assert_eq!(cfg.tag.same_qualified_ref_policy, DuplicatePolicy::Error);
+    }
 
-        let toml_str2 = r#"
-        [tag]
-        conflict_resolution = "warn_only"
-        "#;
-        let cfg2: Config = toml::from_str(toml_str2).unwrap();
-        assert_eq!(cfg2.tag.conflict_resolution, TagConflictPolicy::WarnOnly);
-
-        let toml_str3 = r#"
-        [tag]
-        conflict_resolution = "ignore"
-        "#;
-        let cfg3: Config = toml::from_str(toml_str3).unwrap();
-        assert_eq!(cfg3.tag.conflict_resolution, TagConflictPolicy::Ignore);
+    #[test]
+    fn parses_duplicate_policies() {
+        let cfg: Config =
+            toml::from_str("[tag]\nsame_name_policy = 'warn'\nsame_qualified_ref_policy = 'allow'")
+                .unwrap();
+        assert_eq!(cfg.tag.same_name_policy, DuplicatePolicy::Warn);
+        assert_eq!(cfg.tag.same_qualified_ref_policy, DuplicatePolicy::Allow);
     }
 }

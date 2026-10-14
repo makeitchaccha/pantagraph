@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use std::fmt;
 
-use crate::config::TagConflictPolicy;
+use crate::config::DuplicatePolicy;
 use crate::domain::{Tag, TagId};
 use crate::store::TomlStore;
 
@@ -130,10 +130,31 @@ pub fn resolve_tag(store: &TomlStore, name_or_id: &str) -> Result<Tag> {
 pub fn handle_tag_create(
     store: &TomlStore,
     name: String,
+    specifier: Option<String>,
+    description: String,
+    aliases: Vec<String>,
+    same_name_policy: DuplicatePolicy,
+    same_qualified_ref_policy: DuplicatePolicy,
+) -> Result<TagResult> {
+    handle_tag_create_inner(
+        store,
+        name,
+        specifier,
+        description,
+        aliases,
+        same_name_policy,
+        same_qualified_ref_policy,
+    )
+}
+
+fn handle_tag_create_inner(
+    store: &TomlStore,
+    name: String,
     mut specifier: Option<String>,
     description: String,
     aliases: Vec<String>,
-    policy: TagConflictPolicy,
+    same_name_policy: DuplicatePolicy,
+    same_qualified_ref_policy: DuplicatePolicy,
 ) -> Result<TagResult> {
     let name_trimmed = name.trim();
     if name_trimmed.is_empty() {
@@ -171,28 +192,39 @@ pub fn handle_tag_create(
         }
     }
 
-    let mut conflicts = Vec::new();
-    if policy != TagConflictPolicy::Ignore {
-        let conflicting_tags = if let Some(ref spec) = clean_specifier {
-            store.find_tags_by_name_and_specifier(tag_name, spec)?
+    let qualified = clean_specifier.as_ref().map(|s| format!("{tag_name}@{s}"));
+    let duplicate_policy = if let Some(ref spec) = clean_specifier {
+        if store
+            .find_tags_by_name_and_specifier(tag_name, spec)?
+            .is_empty()
+        {
+            same_name_policy
         } else {
-            store.find_tags_by_name_or_alias(tag_name)?
-        };
-        if !conflicting_tags.is_empty() {
-            let conflict_label = if let Some(ref s) = clean_specifier {
-                format!("{tag_name}@{s}")
-            } else {
-                tag_name.to_string()
-            };
-            if policy == TagConflictPolicy::Abort {
-                return Err(TagConflictAbort {
-                    label: conflict_label,
-                    tags: conflicting_tags,
-                }
-                .into());
-            }
-            conflicts = conflicting_tags;
+            same_qualified_ref_policy
         }
+    } else {
+        let existing = store.find_tags_by_name_or_alias(tag_name)?;
+        if existing.iter().any(|tag| tag.specifier.is_some()) {
+            same_qualified_ref_policy
+        } else {
+            same_name_policy
+        }
+    };
+    let mut conflicts = Vec::new();
+    let conflicting_tags = if let Some(ref spec) = clean_specifier {
+        store.find_tags_by_name_and_specifier(tag_name, spec)?
+    } else {
+        store.find_tags_by_name_or_alias(tag_name)?
+    };
+    if !conflicting_tags.is_empty() && duplicate_policy != DuplicatePolicy::Allow {
+        if duplicate_policy == DuplicatePolicy::Error {
+            return Err(TagConflictAbort {
+                label: qualified.unwrap_or_else(|| tag_name.to_string()),
+                tags: conflicting_tags,
+            }
+            .into());
+        }
+        conflicts = conflicting_tags;
     }
 
     let tag = Tag::with_specifier(tag_name, clean_specifier, description, clean_aliases);

@@ -40,18 +40,19 @@ Pantagraph はデータディレクトリ直下（例: `data/config.toml`）ま�
 cp config.toml.sample config.toml
 ```
  
-#### タグ競合解決オプション (`conflict_resolution`)
+#### タグ重複ポリシー
  
-既存のタグ名またはエイリアスと重複するタグを新規作成する際の挙動を `config.toml`、またはコマンドライン引数 `--on-conflict <abort|warn-only|ignore>` で指定できます:
+タグ名と `name@specifier` 参照の重複時の挙動を個別に `config.toml` で指定できます:
  
 ```toml
 [tag]
-conflict_resolution = "warn_only" # "warn_only" | "abort" | "ignore"
+same_name_policy = "allow" # "allow" | "warn" | "error"
+same_qualified_ref_policy = "error" # "allow" | "warn" | "error"
 ```
  
-- **`"abort"`**: 競合が検出された場合、エラーを表示して即座に中断（終了）します。
-- **`"warn_only"`** (デフォルト): 標準エラー出力に重複するタグ情報を警告表示し、そのままタグを作成します。
-- **`"ignore"`**: 警告を出さず完全に無視してそのままタグを作成します。
+- **`same_name_policy`** (`"allow"` がデフォルト): specifier のない同名タグの挙動を指定します。
+- **`same_qualified_ref_policy`** (`"error"` がデフォルト): `name@specifier` の重複時の挙動を指定します。
+- **`"warn"`** は警告を表示して作成を続け、**`"error"`** はエラーで中断します。
  
 ---
  
@@ -97,14 +98,13 @@ args = [
 
 #### タグの新規作成
 ```bash
-pantagraph tag create <NAME> [--specifier <SPEC>] [--description <DESC>] [--alias <ALIAS>...] [--on-conflict <abort|warn-only|ignore>]
+pantagraph tag create <NAME> [--specifier <SPEC>] [--description <DESC>] [--alias <ALIAS>...]
 # 例:
 pantagraph tag create rust -d "プログラミング言語Rust" -a rs -a rust-lang
 # 修飾子（specifier）を付与して作成（フラグまたは name@specifier 形式）:
 pantagraph tag create "rust@lang" -d "プログラミング言語Rust"
 pantagraph tag create rust -s game -d "サバイバルゲームRust"
 ```
-*※ `--on-conflict` は `config.toml` の `conflict_resolution` 設定より優先されます。*
 
 #### タグ一覧の表示
 ```bash

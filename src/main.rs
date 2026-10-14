@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 use application::{entry, tag};
 use clap::{Parser, Subcommand};
-use config::{Config, TagConflictPolicy};
+use config::{Config, DuplicatePolicy};
 use domain::{Entry, Tag, TagId};
 use store::TomlStore;
 
@@ -55,9 +55,6 @@ enum TagCommands {
         /// Tag aliases (repeatable)
         #[arg(long = "alias", short = 'a')]
         alias: Vec<String>,
-        /// Tag conflict resolution policy (abort, warn-only, ignore)
-        #[arg(long = "on-conflict")]
-        on_conflict: Option<TagConflictPolicy>,
     },
     /// List all tags
     List {
@@ -176,12 +173,16 @@ fn run() -> Result<()> {
                 specifier,
                 description,
                 alias,
-                on_conflict,
-            } => {
-                let policy = on_conflict.unwrap_or(config.tag.conflict_resolution);
-                tag::handle_tag_create(&store, name, specifier, description, alias, policy)
-                    .map(present_tag_result)
-            }
+            } => tag::handle_tag_create(
+                &store,
+                name,
+                specifier,
+                description,
+                alias,
+                config.tag.same_name_policy,
+                config.tag.same_qualified_ref_policy,
+            )
+            .map(present_tag_result),
             TagCommands::List { name } => {
                 tag::handle_tag_list(&store, name).map(present_tag_result)
             }
@@ -549,7 +550,8 @@ mod tests {
             None,
             "Rust programming language".to_string(),
             vec!["rs".to_string(), "rust-lang".to_string()],
-            TagConflictPolicy::Abort,
+            DuplicatePolicy::Allow,
+            DuplicatePolicy::Error,
         )
         .is_ok());
 
@@ -584,7 +586,8 @@ mod tests {
             None,
             "".to_string(),
             vec!["sys".to_string()],
-            TagConflictPolicy::Abort,
+            DuplicatePolicy::Allow,
+            DuplicatePolicy::Error,
         )
         .is_ok());
 
@@ -661,7 +664,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tag_create_conflict_policies() {
+    fn test_tag_create_duplicate_policies() {
         let dir =
             std::env::temp_dir().join(format!("pantagraph_test_conflict_{}", uuid::Uuid::now_v7()));
         let store = TomlStore::new(&dir).unwrap();
@@ -671,51 +674,43 @@ mod tests {
             .create_tag(Tag::with_aliases("alpha", "desc", vec!["al".to_string()]))
             .unwrap();
 
-        // 1. Conflict on name with TagConflictPolicy::Abort -> err
-        let res_abort = tag::handle_tag_create(
+        // Duplicate unqualified names are allowed by default.
+        let res_allowed = tag::handle_tag_create(
             &store,
             "alpha".to_string(),
             None,
             "".to_string(),
             vec![],
-            TagConflictPolicy::Abort,
+            DuplicatePolicy::Allow,
+            DuplicatePolicy::Error,
         );
-        assert!(res_abort.is_err());
+        assert!(res_allowed.is_ok());
 
-        // 2. Conflict on alias with TagConflictPolicy::Abort -> err
-        let res_alias_abort = tag::handle_tag_create(
+        // Duplicate aliases/names are controlled by the same name policy.
+        let res_alias = tag::handle_tag_create(
             &store,
             "al".to_string(),
             None,
             "".to_string(),
             vec![],
-            TagConflictPolicy::Abort,
+            DuplicatePolicy::Error,
+            DuplicatePolicy::Error,
         );
-        assert!(res_alias_abort.is_err());
+        assert!(res_alias.is_err());
 
-        // 3. Conflict with TagConflictPolicy::WarnOnly -> succeeds and warns
+        // Name policy can be set to warn.
         let res_warn = tag::handle_tag_create(
             &store,
             "alpha".to_string(),
             None,
             "".to_string(),
             vec![],
-            TagConflictPolicy::WarnOnly,
+            DuplicatePolicy::Warn,
+            DuplicatePolicy::Error,
         );
         assert!(res_warn.is_ok());
 
-        // 4. Conflict with TagConflictPolicy::Ignore -> succeeds
-        let res_ignore = tag::handle_tag_create(
-            &store,
-            "alpha".to_string(),
-            None,
-            "".to_string(),
-            vec![],
-            TagConflictPolicy::Ignore,
-        );
-        assert!(res_ignore.is_ok());
-
-        // Now three tags with name "alpha" exist
+        // Now three tags with name "alpha" exist.
         let found = store.find_tags_by_name_or_alias("alpha").unwrap();
         assert_eq!(found.len(), 3);
 
@@ -737,7 +732,8 @@ mod tests {
             None,
             "Rust language".to_string(),
             vec!["rs".to_string()],
-            TagConflictPolicy::Ignore,
+            DuplicatePolicy::Allow,
+            DuplicatePolicy::Error,
         )
         .is_ok());
 
@@ -747,7 +743,8 @@ mod tests {
             Some("game".to_string()),
             "Rust video game".to_string(),
             vec![],
-            TagConflictPolicy::Ignore,
+            DuplicatePolicy::Allow,
+            DuplicatePolicy::Error,
         )
         .is_ok());
 
@@ -771,49 +768,53 @@ mod tests {
         assert_eq!(alias_spec.id, lang_tag.id);
 
         // When rust@lang and rust@game exist:
-        // 1. Adding "rust@editor" with TagConflictPolicy::Abort passes without error (no conflict on rust@editor)
+        // A different qualified ref is allowed.
         assert!(tag::handle_tag_create(
             &store,
             "rust@editor".to_string(),
             None,
             "Rust editor".to_string(),
             vec![],
-            TagConflictPolicy::Abort,
+            DuplicatePolicy::Allow,
+            DuplicatePolicy::Error,
         )
         .is_ok());
 
-        // 2. Adding "rust@lang" again with TagConflictPolicy::Abort fails (conflict on rust@lang)
+        // Duplicate qualified refs fail by default.
         assert!(tag::handle_tag_create(
             &store,
             "rust@lang".to_string(),
             None,
             "Rust lang duplicate".to_string(),
             vec![],
-            TagConflictPolicy::Abort,
+            DuplicatePolicy::Allow,
+            DuplicatePolicy::Error,
         )
         .is_err());
 
-        // 3. Adding bare "rust" without specifier with TagConflictPolicy::Abort fails (conflicts with existing "rust" tags)
+        // A bare name matching an existing qualified name uses the qualified policy.
         assert!(tag::handle_tag_create(
             &store,
             "rust".to_string(),
             None,
             "Bare rust".to_string(),
             vec![],
-            TagConflictPolicy::Abort,
+            DuplicatePolicy::Allow,
+            DuplicatePolicy::Error,
         )
         .is_err());
 
-        // 4. Adding bare "rust" with TagConflictPolicy::WarnOnly succeeds
+        // A bare duplicate with only other bare tags uses the name policy.
         assert!(tag::handle_tag_create(
             &store,
             "rust".to_string(),
             None,
             "Bare rust".to_string(),
             vec![],
-            TagConflictPolicy::WarnOnly,
+            DuplicatePolicy::Error,
+            DuplicatePolicy::Error,
         )
-        .is_ok());
+        .is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

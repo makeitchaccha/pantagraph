@@ -3,9 +3,7 @@
 # Place this file as `config.toml` (in your current directory or in `<data_dir>/config.toml`).
 
 [tag]
-# Conflict resolution policy when adding a new tag that shares a name or alias with an existing tag.
-# Available options:
-# - "warn_only": (Default) Print warning to stderr and continue creating the tag.
-# - "abort": Abort immediately with an error and show conflicting tag details.
-# - "ignore": Completely ignore conflicts without warnings.
-conflict_resolution = "warn_only"
+# Policy for duplicate names: allow, warn, or error.
+same_name_policy = "allow"
+# Policy for duplicate name@specifier references: allow, warn, or error.
+same_qualified_ref_policy = "error"

@@ -40,18 +40,19 @@ A sample configuration is provided in [`config.toml.sample`](tool.toml.sample):
 cp config.toml.sample config.toml
 ```
 
-#### Tag Conflict Resolution Options
+#### Duplicate Tag Policies
 
-When adding a new tag whose name or alias matches an existing tag, behavior can be customized in `config.toml` or overridden per command via `--on-conflict <abort|warn-only|ignore>`:
+Duplicate tag names and duplicate qualified references can be configured independently:
 
 ```toml
 [tag]
-conflict_resolution = "warn_only" # "warn_only" | "abort" | "ignore"
+same_name_policy = "allow" # "allow" | "warn" | "error"
+same_qualified_ref_policy = "error" # "allow" | "warn" | "error"
 ```
 
-- **`"abort"`**: Abort immediately with an error if a conflict is detected.
-- **`"warn_only"`** (Default): Print a warning to stderr listing conflicting tags and continue creating the tag.
-- **`"ignore"`**: Completely ignore conflicts without warnings.
+- **`same_name_policy`** (`"allow"` by default): Controls duplicate names without a specifier.
+- **`same_qualified_ref_policy`** (`"error"` by default): Controls duplicate `name@specifier` references.
+- **`"warn"`** prints a warning and continues; **`"error"`** aborts with conflict details.
 
 ---
 
@@ -97,14 +98,13 @@ args = [
 
 #### Create a tag
 ```bash
-pantagraph tag create <NAME> [--specifier <SPEC>] [--description <DESC>] [--alias <ALIAS>...] [--on-conflict <abort|warn-only|ignore>]
+pantagraph tag create <NAME> [--specifier <SPEC>] [--description <DESC>] [--alias <ALIAS>...]
 # Example:
 pantagraph tag create rust -d "Rust programming language" -a rs -a rust-lang
 # Or create with a specifier directly (via flag or name@specifier):
 pantagraph tag create "rust@lang" -d "Rust programming language"
 pantagraph tag create rust -s game -d "Rust survival game"
 ```
-*Note: `--on-conflict` overrides the `conflict_resolution` setting in `config.toml`.*
 
 #### List tags
 ```bash
