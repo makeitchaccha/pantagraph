@@ -6,7 +6,7 @@ use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExten
 
 use crate::domain::{Entry, EntryId, Tag, TagId};
 
-const SCHEMA_VERSION: &str = "2";
+const SCHEMA_VERSION: &str = "3";
 
 /// Fast metadata signature for the canonical TOML inputs.
 /// Store writes also remove the cache; this signature detects external edits.
@@ -123,7 +123,7 @@ impl SqliteCache {
                 values.push(Value::Text(id.to_string()));
             }
             conditions.push(format!(
-                "e.id IN (SELECT entry_id FROM entry_tags WHERE tag_id IN ({placeholders}) GROUP BY entry_id HAVING COUNT(DISTINCT tag_id) = {})",
+                "e.internal_entry_id IN (SELECT et.internal_entry_id FROM entry_tags et JOIN tags t ON t.internal_tag_id = et.internal_tag_id WHERE t.id IN ({placeholders}) GROUP BY et.internal_entry_id HAVING COUNT(DISTINCT et.internal_tag_id) = {})",
                 unique_tag_ids.len()
             ));
         }
@@ -136,7 +136,9 @@ impl SqliteCache {
         let sql = format!(
             "SELECT e.id, e.url, e.archiver, e.archive_path, e.description, \
              (SELECT GROUP_CONCAT(tag_id, '|') FROM (
-                 SELECT tag_id FROM entry_tags WHERE entry_id = e.id ORDER BY ordinal
+                 SELECT t.id AS tag_id FROM entry_tags et \
+                 JOIN tags t ON t.internal_tag_id = et.internal_tag_id \
+                 WHERE et.internal_entry_id = e.internal_entry_id ORDER BY et.ordinal
              )) \
              FROM entries e {where_clause} ORDER BY e.ordinal"
         );
@@ -235,15 +237,18 @@ impl SqliteCache {
             "PRAGMA journal_mode = DELETE;
              CREATE TABLE cache_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
              CREATE TABLE tags (
-                 id TEXT PRIMARY KEY, name TEXT NOT NULL, specifier TEXT
+                 internal_tag_id INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE,
+                 name TEXT NOT NULL, specifier TEXT
              );
              CREATE TABLE entries (
-                 id TEXT PRIMARY KEY, ordinal INTEGER NOT NULL, url TEXT NOT NULL,
+                 internal_entry_id INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE,
+                 ordinal INTEGER NOT NULL, url TEXT NOT NULL,
                  archiver TEXT, archive_path TEXT, description TEXT NOT NULL
              );
              CREATE TABLE entry_tags (
-                 entry_id TEXT NOT NULL, ordinal INTEGER NOT NULL, tag_id TEXT NOT NULL,
-                 PRIMARY KEY (entry_id, ordinal)
+                 internal_entry_id INTEGER NOT NULL, ordinal INTEGER NOT NULL,
+                 internal_tag_id INTEGER NOT NULL,
+                 PRIMARY KEY (internal_entry_id, ordinal)
              );",
         )?;
 
@@ -261,7 +266,9 @@ impl SqliteCache {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?;
             let mut insert_tag = transaction.prepare(
-                "INSERT INTO entry_tags (entry_id, ordinal, tag_id) VALUES (?1, ?2, ?3)",
+                "INSERT INTO entry_tags (internal_entry_id, ordinal, internal_tag_id) \
+                 SELECT e.internal_entry_id, ?2, t.internal_tag_id \
+                 FROM entries e JOIN tags t ON t.id = ?3 WHERE e.id = ?1",
             )?;
             for (ordinal, entry) in entries.iter().enumerate() {
                 insert_entry.execute(params![
@@ -294,7 +301,7 @@ impl SqliteCache {
             [&signature.entries],
         )?;
         transaction.execute_batch(
-            "CREATE INDEX idx_entry_tags_tag_entry ON entry_tags(tag_id, entry_id);
+            "CREATE INDEX idx_entry_tags_tag_entry ON entry_tags(internal_tag_id, internal_entry_id);
              CREATE INDEX idx_entries_archiver_ordinal ON entries(archiver, ordinal);",
         )?;
         transaction.commit()?;
