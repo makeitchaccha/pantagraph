@@ -1,19 +1,19 @@
 use std::{
-    fs,
+    fs::{self, File},
+    io::{BufWriter, Write},
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use rand::{rngs::StdRng, RngExt, SeedableRng};
-use serde::Serialize;
 use uuid::Uuid;
 
 use pantagraph::domain::{Entry, EntryId, Tag, TagId};
 
 #[derive(Debug, Parser)]
 #[command(name = "generate-fixture")]
-#[command(about = "Generate a Pantagraph TOML fixture")]
+#[command(about = "Generate a Pantagraph JSONL fixture")]
 struct Args {
     /// Number of tags to generate.
     #[arg(long, default_value_t = 500)]
@@ -46,16 +46,6 @@ struct Args {
     /// Output directory.
     #[arg(long, default_value = "./fixture")]
     output: PathBuf,
-}
-
-#[derive(Debug, Serialize)]
-struct TagsFile {
-    tags: Vec<Tag>,
-}
-
-#[derive(Debug, Serialize)]
-struct EntriesFile {
-    entries: Vec<Entry>,
 }
 
 fn main() -> Result<()> {
@@ -101,31 +91,31 @@ fn generate_fixture(
         words
     };
     let tags = generate_tags(&mut rng, tag_count, words);
-    let entries = generate_entries(&mut rng, entry_count, &tags, min_tags, max_tags, words);
+    write_jsonl(output.join("tags.jsonl"), &tags).context("failed to write tags.jsonl")?;
 
-    let tags_toml = toml::to_string_pretty(&TagsFile { tags: tags.clone() })
-        .context("failed to serialize tags.toml")?;
+    let mut entries_writer = BufWriter::new(
+        File::create(output.join("entries.jsonl")).context("failed to create entries.jsonl")?,
+    );
+    let mut archived_entries = 0;
+    let mut total_tag_assignments = 0;
+    for entry in generate_entries(&mut rng, entry_count, &tags, min_tags, max_tags, words) {
+        if entry.archiver.is_some() {
+            archived_entries += 1;
+        }
+        total_tag_assignments += entry.tag_ids.len();
+        serde_json::to_writer(&mut entries_writer, &entry).context("failed to serialize entry")?;
+        entries_writer
+            .write_all(b"\n")
+            .context("failed to write entry")?;
+    }
+    entries_writer
+        .flush()
+        .context("failed to flush entries.jsonl")?;
 
-    let entries_toml = toml::to_string_pretty(&EntriesFile {
-        entries: entries.clone(),
-    })
-    .context("failed to serialize entries.toml")?;
-
-    fs::write(output.join("tags.toml"), tags_toml).context("failed to write tags.toml")?;
-
-    fs::write(output.join("entries.toml"), entries_toml).context("failed to write entries.toml")?;
-
-    let archived_entries = entries
-        .iter()
-        .filter(|entry| entry.archiver.is_some())
-        .count();
-
-    let total_tag_assignments: usize = entries.iter().map(|entry| entry.tag_ids.len()).sum();
-
-    let average_tags = if entries.is_empty() {
+    let average_tags = if entry_count == 0 {
         0.0
     } else {
-        total_tag_assignments as f64 / entries.len() as f64
+        total_tag_assignments as f64 / entry_count as f64
     };
 
     let readme = format!(
@@ -152,11 +142,11 @@ Generated with:
 
 Files:
 
-    tags.toml
-    entries.toml
+    tags.jsonl
+    entries.jsonl
 ",
         tags.len(),
-        entries.len(),
+        entry_count,
         min_tags,
         max_tags,
         tag_count,
@@ -173,12 +163,22 @@ Files:
     println!("Generated fixture:");
     println!("  output:           {}", output.display());
     println!("  tags:             {}", tags.len());
-    println!("  entries:          {}", entries.len());
+    println!("  entries:          {entry_count}");
     println!("  tags per entry:   {min_tags}..={max_tags}");
     println!("  average tags:     {average_tags:.2}");
     println!("  archived entries: {archived_entries}");
     println!("  seed:             {seed}");
 
+    Ok(())
+}
+
+fn write_jsonl<T: serde::Serialize>(path: PathBuf, values: &[T]) -> Result<()> {
+    let mut writer = BufWriter::new(File::create(path)?);
+    for value in values {
+        serde_json::to_writer(&mut writer, value)?;
+        writer.write_all(b"\n")?;
+    }
+    writer.flush()?;
     Ok(())
 }
 
@@ -217,42 +217,40 @@ fn generate_tags(rng: &mut StdRng, count: usize, words: &[String]) -> Vec<Tag> {
         .collect()
 }
 
-fn generate_entries(
-    rng: &mut StdRng,
+fn generate_entries<'a>(
+    rng: &'a mut StdRng,
     count: usize,
-    tags: &[Tag],
+    tags: &'a [Tag],
     min_tags: usize,
     max_tags: usize,
-    words: &[String],
-) -> Vec<Entry> {
+    words: &'a [String],
+) -> impl Iterator<Item = Entry> + 'a {
     const ARCHIVERS: &[Option<&str>] = &[None, Some("single-file"), Some("curl"), Some("yt-dlp")];
 
-    (0..count)
-        .map(|i| {
-            let id = EntryId(Uuid::now_v7());
+    (0..count).map(move |i| {
+        let id = EntryId(Uuid::now_v7());
 
-            let first = &words[rng.random_range(0..words.len())];
-            let second = &words[rng.random_range(0..words.len())];
-            let url = format!("https://example.com/{first}/{second}/{i}");
+        let first = &words[rng.random_range(0..words.len())];
+        let second = &words[rng.random_range(0..words.len())];
+        let url = format!("https://example.com/{first}/{second}/{i}");
 
-            let archiver = ARCHIVERS[rng.random_range(0..ARCHIVERS.len())].map(str::to_string);
+        let archiver = ARCHIVERS[rng.random_range(0..ARCHIVERS.len())].map(str::to_string);
 
-            let archive_path = archiver
-                .as_ref()
-                .map(|name| format!("archives/{name}/{id}.html"));
+        let archive_path = archiver
+            .as_ref()
+            .map(|name| format!("archives/{name}/{id}.html"));
 
-            let tag_ids = generate_tag_ids(rng, tags, min_tags, max_tags);
+        let tag_ids = generate_tag_ids(rng, tags, min_tags, max_tags);
 
-            Entry {
-                id,
-                url,
-                archiver,
-                archive_path,
-                description: format!("A {first} {second} resource"),
-                tag_ids,
-            }
-        })
-        .collect()
+        Entry {
+            id,
+            url,
+            archiver,
+            archive_path,
+            description: format!("A {first} {second} resource"),
+            tag_ids,
+        }
+    })
 }
 
 fn format_tag_name(words: &[String], index: usize) -> String {

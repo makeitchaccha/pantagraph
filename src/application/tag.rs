@@ -3,7 +3,7 @@ use std::fmt;
 
 use crate::config::DuplicatePolicy;
 use crate::domain::{Tag, TagId};
-use crate::store::TomlStore;
+use crate::store::JsonlStore;
 
 #[derive(Debug)]
 pub enum TagResult {
@@ -71,7 +71,7 @@ pub fn parse_tag_ref(input: &str) -> (&str, Option<&str>, Option<usize>) {
 }
 
 /// Resolve a tag reference to a single tag, preserving the CLI's disambiguation behavior.
-pub fn resolve_tag(store: &TomlStore, name_or_id: &str) -> Result<Tag> {
+pub fn resolve_tag(store: &JsonlStore, name_or_id: &str) -> Result<Tag> {
     if let Ok(tag_id) = name_or_id.parse::<TagId>() {
         if let Some(tag) = store.find_tag_by_id(&tag_id)? {
             return Ok(tag);
@@ -128,7 +128,7 @@ pub fn resolve_tag(store: &TomlStore, name_or_id: &str) -> Result<Tag> {
 }
 
 pub fn handle_tag_create(
-    store: &TomlStore,
+    store: &JsonlStore,
     name: String,
     specifier: Option<String>,
     description: String,
@@ -148,7 +148,7 @@ pub fn handle_tag_create(
 }
 
 fn handle_tag_create_inner(
-    store: &TomlStore,
+    store: &JsonlStore,
     name: String,
     mut specifier: Option<String>,
     description: String,
@@ -232,7 +232,7 @@ fn handle_tag_create_inner(
     Ok(TagResult::Created { tag, conflicts })
 }
 
-pub fn handle_tag_list(store: &TomlStore, name_filter: Option<String>) -> Result<TagResult> {
+pub fn handle_tag_list(store: &JsonlStore, name_filter: Option<String>) -> Result<TagResult> {
     let tags: Vec<Tag> = if let Some(ref filter) = name_filter {
         store
             .list_tags()?
@@ -248,14 +248,14 @@ pub fn handle_tag_list(store: &TomlStore, name_filter: Option<String>) -> Result
     Ok(TagResult::Listed(tags))
 }
 
-pub fn handle_tag_show(store: &TomlStore, name_or_id: String) -> Result<TagResult> {
+pub fn handle_tag_show(store: &JsonlStore, name_or_id: String) -> Result<TagResult> {
     let tag = resolve_tag(store, &name_or_id)?;
     let entries = store.find_entries_by_tag(&tag.id)?;
     Ok(TagResult::Show { tag, entries })
 }
 
 pub fn handle_tag_rename(
-    store: &TomlStore,
+    store: &JsonlStore,
     name_or_id: String,
     new_name: String,
 ) -> Result<TagResult> {
@@ -273,7 +273,7 @@ pub fn handle_tag_rename(
 }
 
 pub fn handle_tag_alias_add(
-    store: &TomlStore,
+    store: &JsonlStore,
     name_or_id: String,
     alias: String,
 ) -> Result<TagResult> {
@@ -286,7 +286,7 @@ pub fn handle_tag_alias_add(
 }
 
 pub fn handle_tag_alias_remove(
-    store: &TomlStore,
+    store: &JsonlStore,
     name_or_id: String,
     alias: String,
 ) -> Result<TagResult> {
@@ -298,7 +298,7 @@ pub fn handle_tag_alias_remove(
     })
 }
 
-pub fn handle_tag_alias_list(store: &TomlStore, name_or_id: String) -> Result<TagResult> {
+pub fn handle_tag_alias_list(store: &JsonlStore, name_or_id: String) -> Result<TagResult> {
     let tag = resolve_tag(store, &name_or_id)?;
     Ok(TagResult::AliasList(tag))
 }

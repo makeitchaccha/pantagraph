@@ -8,9 +8,9 @@ use std::collections::HashMap;
 use anyhow::Result;
 use application::{entry, tag};
 use clap::{Parser, Subcommand};
-use config::{Config, DuplicatePolicy};
+use config::Config;
 use domain::{Entry, Tag, TagId};
-use store::TomlStore;
+use store::JsonlStore;
 
 #[derive(Parser)]
 #[command(
@@ -163,7 +163,7 @@ enum EntryCommands {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    let store = TomlStore::new(&cli.data_dir)?;
+    let store = JsonlStore::new(&cli.data_dir)?;
     let config = Config::load_from_dir(store.data_dir())?;
 
     match cli.command {
@@ -453,6 +453,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DuplicatePolicy;
     use crate::domain::Tag;
 
     #[test]
@@ -476,7 +477,7 @@ mod tests {
     fn test_handle_tag_rename() {
         let dir =
             std::env::temp_dir().join(format!("pantagraph_test_main_{}", uuid::Uuid::now_v7()));
-        let store = TomlStore::new(&dir).unwrap();
+        let store = JsonlStore::new(&dir).unwrap();
         let tag = store.create_tag(Tag::new("old-tag", "desc")).unwrap();
 
         // Rename via name
@@ -511,7 +512,7 @@ mod tests {
     fn test_handle_tag_rename_disambiguation() {
         let dir =
             std::env::temp_dir().join(format!("pantagraph_test_disambig_{}", uuid::Uuid::now_v7()));
-        let store = TomlStore::new(&dir).unwrap();
+        let store = JsonlStore::new(&dir).unwrap();
         let tag1 = store.create_tag(Tag::new("dupe", "first")).unwrap();
         let tag2 = store.create_tag(Tag::new("dupe", "second")).unwrap();
 
@@ -541,7 +542,7 @@ mod tests {
             "pantagraph_test_alias_int_{}",
             uuid::Uuid::now_v7()
         ));
-        let store = TomlStore::new(&dir).unwrap();
+        let store = JsonlStore::new(&dir).unwrap();
 
         // 1. Create tag with aliases
         assert!(tag::handle_tag_create(
@@ -631,7 +632,7 @@ mod tests {
             "pantagraph_test_alias_dis_{}",
             uuid::Uuid::now_v7()
         ));
-        let store = TomlStore::new(&dir).unwrap();
+        let store = JsonlStore::new(&dir).unwrap();
 
         let tag1 = store
             .create_tag(Tag::with_aliases(
@@ -667,7 +668,7 @@ mod tests {
     fn test_tag_create_duplicate_policies() {
         let dir =
             std::env::temp_dir().join(format!("pantagraph_test_conflict_{}", uuid::Uuid::now_v7()));
-        let store = TomlStore::new(&dir).unwrap();
+        let store = JsonlStore::new(&dir).unwrap();
 
         // Initial tag
         store
@@ -723,7 +724,7 @@ mod tests {
             "pantagraph_test_specifier_{}",
             uuid::Uuid::now_v7()
         ));
-        let store = TomlStore::new(&dir).unwrap();
+        let store = JsonlStore::new(&dir).unwrap();
 
         // Create two tags with same name "rust", but different specifiers
         assert!(tag::handle_tag_create(

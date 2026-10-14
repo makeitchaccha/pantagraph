@@ -9,7 +9,7 @@
 - **タグ管理**: 階層を持たないフラットなタグ管理。エイリアス（別名）の設定に対応し、同名・同一エイリアスのタグもUUIDによって共存・識別可能（`name#N` 記法による曖昧さ解消）。
 - **エントリ管理**: WebのURL、説明、タグを紐付けて記録。
 - **プラグイン可能な外部アーカイバ**: `tool.toml` の設定により、外部ツール（`single-file` や `yt-dlp` など）を呼び出してローカルスナップショットを自動保存。
-- **TOMLベースのストレージ**: 人間が読みやすく、Git等のバージョン管理にも適したプレーンテキスト保存（`tags.toml`, `entries.toml`）。
+- **JSONLベースのストレージ**: タグとエントリを1行1レコードのJSONで保存（`tags.jsonl`, `entries.jsonl`）。既存のTOMLデータは初回起動時にJSONLへ移行されます。
 
 ---
 
@@ -196,8 +196,8 @@ pantagraph entry tag <ENTRY_ID> <TAG>
 
 ```
 data/
-├── entries.toml
-├── tags.toml
+├── entries.jsonl
+├── tags.jsonl
 ├── tool.toml        # (tool.toml をここに配置することも可能)
 └── archives/
     └── <entry_id>/  # 外部アーカイバによって保存されたファイル群

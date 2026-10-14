@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 
 use crate::archiver::ToolConfig;
 use crate::domain::{Entry, EntryId, TagId};
-use crate::store::TomlStore;
+use crate::store::JsonlStore;
 
 use super::tag::resolve_tag;
 
@@ -30,7 +30,7 @@ pub enum EntryResult {
 }
 
 /// Build a TagId → display name lookup from all tags.
-fn tag_name_map(store: &TomlStore) -> Result<HashMap<TagId, String>> {
+fn tag_name_map(store: &JsonlStore) -> Result<HashMap<TagId, String>> {
     Ok(store
         .list_tags()?
         .into_iter()
@@ -39,7 +39,7 @@ fn tag_name_map(store: &TomlStore) -> Result<HashMap<TagId, String>> {
 }
 
 pub fn handle_entry_add(
-    store: &TomlStore,
+    store: &JsonlStore,
     archiver: String,
     url: String,
     description: String,
@@ -83,7 +83,7 @@ pub fn handle_entry_add(
 }
 
 pub fn handle_entry_list(
-    store: &TomlStore,
+    store: &JsonlStore,
     archiver: Option<String>,
     tag_refs: Vec<String>,
 ) -> Result<EntryResult> {
@@ -102,7 +102,7 @@ pub fn handle_entry_list(
     Ok(EntryResult::Listed { entries, names })
 }
 
-pub fn handle_entry_show(store: &TomlStore, id: String) -> Result<EntryResult> {
+pub fn handle_entry_show(store: &JsonlStore, id: String) -> Result<EntryResult> {
     let entry_id: EntryId = id.parse().context("Invalid entry ID")?;
     let entry = store
         .find_entry_by_id(&entry_id)?
@@ -113,7 +113,7 @@ pub fn handle_entry_show(store: &TomlStore, id: String) -> Result<EntryResult> {
 }
 
 pub fn handle_entry_tag(
-    store: &TomlStore,
+    store: &JsonlStore,
     entry_id: String,
     tag_ref: String,
 ) -> Result<EntryResult> {

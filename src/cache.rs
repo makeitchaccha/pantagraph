@@ -1,5 +1,9 @@
-use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
+use std::{
+    collections::HashMap,
+    io::{BufRead, BufReader},
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
 use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
@@ -8,7 +12,7 @@ use crate::domain::{Entry, EntryId, Tag, TagId};
 
 const SCHEMA_VERSION: &str = "3";
 
-/// Fast metadata signature for the canonical TOML inputs.
+/// Fast metadata signature for the canonical JSONL inputs.
 /// Store writes also remove the cache; this signature detects external edits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SourceSignature {
@@ -181,12 +185,14 @@ impl SqliteCache {
     pub(crate) fn rebuild(
         &self,
         signature: &SourceSignature,
-        tags: &[Tag],
-        entries: &[Entry],
+        tags_path: &Path,
+        entries_path: &Path,
     ) -> Result<()> {
-        if let Err(first_error) = self.rebuild_once(signature, tags, entries) {
-            self.rebuild_once(signature, tags, entries)
-                .with_context(|| format!("Failed to rebuild SQLite cache after: {first_error:#}"))?;
+        if let Err(first_error) = self.rebuild_once(signature, tags_path, entries_path) {
+            self.rebuild_once(signature, tags_path, entries_path)
+                .with_context(|| {
+                    format!("Failed to rebuild SQLite cache after: {first_error:#}")
+                })?;
         }
         Ok(())
     }
@@ -194,14 +200,19 @@ impl SqliteCache {
     fn rebuild_once(
         &self,
         signature: &SourceSignature,
-        tags: &[Tag],
-        entries: &[Entry],
+        tags_path: &Path,
+        entries_path: &Path,
     ) -> Result<()> {
         let temporary_path = self.temporary_path();
-        let result = self.rebuild_into(&temporary_path, signature, tags, entries);
+        let result = self.rebuild_into(&temporary_path, signature, tags_path, entries_path);
         if let Err(error) = result {
             remove_sqlite_files(&temporary_path);
             return Err(error);
+        }
+
+        if SourceSignature::read(tags_path, entries_path)? != *signature {
+            remove_sqlite_files(&temporary_path);
+            anyhow::bail!("JSONL source files changed during cache rebuild");
         }
 
         if let Err(error) = std::fs::rename(&temporary_path, &self.path) {
@@ -228,8 +239,8 @@ impl SqliteCache {
         &self,
         path: &Path,
         signature: &SourceSignature,
-        tags: &[Tag],
-        entries: &[Entry],
+        tags_path: &Path,
+        entries_path: &Path,
     ) -> Result<()> {
         let mut connection = Connection::open(path)
             .with_context(|| format!("Failed to create cache {}", path.display()))?;
@@ -253,13 +264,7 @@ impl SqliteCache {
         )?;
 
         let transaction = connection.transaction()?;
-        {
-            let mut statement = transaction
-                .prepare("INSERT INTO tags (id, name, specifier) VALUES (?1, ?2, ?3)")?;
-            for tag in tags {
-                statement.execute(params![tag.id.to_string(), tag.name, tag.specifier])?;
-            }
-        }
+        let tag_ids = insert_tags(&transaction, tags_path)?;
         {
             let mut insert_entry = transaction.prepare(
                 "INSERT INTO entries (id, ordinal, url, archiver, archive_path, description) \
@@ -267,10 +272,28 @@ impl SqliteCache {
             )?;
             let mut insert_tag = transaction.prepare(
                 "INSERT INTO entry_tags (internal_entry_id, ordinal, internal_tag_id) \
-                 SELECT e.internal_entry_id, ?2, t.internal_tag_id \
-                 FROM entries e JOIN tags t ON t.id = ?3 WHERE e.id = ?1",
+                 SELECT internal_entry_id, ?2, ?3 FROM entries WHERE id = ?1",
             )?;
-            for (ordinal, entry) in entries.iter().enumerate() {
+            let file = std::fs::File::open(entries_path)
+                .with_context(|| format!("Failed to open {}", entries_path.display()))?;
+            for (ordinal, line) in BufReader::new(file).lines().enumerate() {
+                let line = line.with_context(|| {
+                    format!(
+                        "Failed to read {} at line {}",
+                        entries_path.display(),
+                        ordinal + 1
+                    )
+                })?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let entry: Entry = serde_json::from_str(&line).with_context(|| {
+                    format!(
+                        "Failed to parse {} at line {}",
+                        entries_path.display(),
+                        ordinal + 1
+                    )
+                })?;
                 insert_entry.execute(params![
                     entry.id.to_string(),
                     ordinal as i64,
@@ -280,10 +303,13 @@ impl SqliteCache {
                     entry.description,
                 ])?;
                 for (tag_ordinal, tag_id) in entry.tag_ids.iter().enumerate() {
+                    let internal_tag_id = tag_ids.get(tag_id).with_context(|| {
+                        format!("Entry {} references unknown tag {}", entry.id, tag_id)
+                    })?;
                     insert_tag.execute(params![
                         entry.id.to_string(),
                         tag_ordinal as i64,
-                        tag_id.to_string()
+                        internal_tag_id
                     ])?;
                 }
             }
@@ -307,6 +333,40 @@ impl SqliteCache {
         transaction.commit()?;
         Ok(())
     }
+}
+
+fn insert_tags(
+    transaction: &rusqlite::Transaction<'_>,
+    tags_path: &Path,
+) -> Result<HashMap<TagId, i64>> {
+    let file = std::fs::File::open(tags_path)
+        .with_context(|| format!("Failed to open {}", tags_path.display()))?;
+    let mut ids = HashMap::new();
+    let mut statement =
+        transaction.prepare("INSERT INTO tags (id, name, specifier) VALUES (?1, ?2, ?3)")?;
+    for (index, line) in BufReader::new(file).lines().enumerate() {
+        let line = line.with_context(|| {
+            format!(
+                "Failed to read {} at line {}",
+                tags_path.display(),
+                index + 1
+            )
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let tag: Tag = serde_json::from_str(&line).with_context(|| {
+            format!(
+                "Failed to parse {} at line {}",
+                tags_path.display(),
+                index + 1
+            )
+        })?;
+        statement.execute(params![tag.id.to_string(), tag.name, tag.specifier])?;
+        let internal_id = transaction.last_insert_rowid();
+        ids.insert(tag.id, internal_id);
+    }
+    Ok(ids)
 }
 
 fn remove_sqlite_sidecars(path: &Path) {
