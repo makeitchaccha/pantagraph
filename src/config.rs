@@ -1,8 +1,8 @@
-use std::fs;
-use std::path::Path;
 use anyhow::{Context, Result};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum, Default)]
 #[serde(rename_all = "snake_case")]
@@ -46,8 +46,8 @@ impl Config {
     pub fn load_from_file(path: &Path) -> Result<Self> {
         let content = fs::read_to_string(path)
             .with_context(|| format!("Failed to read {}", path.display()))?;
-        let config: Config =
-            toml::from_str(&content).with_context(|| format!("Failed to parse {}", path.display()))?;
+        let config: Config = toml::from_str(&content)
+            .with_context(|| format!("Failed to parse {}", path.display()))?;
         Ok(config)
     }
 }

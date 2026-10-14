@@ -1,8 +1,7 @@
 mod application;
-mod archiver;
 mod config;
-mod domain;
-mod store;
+
+use pantagraph::{archiver, domain, store};
 
 use std::collections::HashMap;
 

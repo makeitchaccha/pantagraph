@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
-use anyhow::{bail, Context, Result};
 use crate::domain::{Entry, EntryId, Tag, TagId};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -118,13 +118,18 @@ impl TomlStore {
             .collect())
     }
 
-    pub fn find_tags_by_name_and_specifier(&self, name_or_alias: &str, specifier: &str) -> Result<Vec<Tag>> {
+    pub fn find_tags_by_name_and_specifier(
+        &self,
+        name_or_alias: &str,
+        specifier: &str,
+    ) -> Result<Vec<Tag>> {
         let file = self.load_tags()?;
         Ok(file
             .tags
             .into_iter()
             .filter(|t| {
-                let matches_name = t.name == name_or_alias || t.aliases.iter().any(|a| a == name_or_alias);
+                let matches_name =
+                    t.name == name_or_alias || t.aliases.iter().any(|a| a == name_or_alias);
                 let matches_specifier = t.specifier.as_deref() == Some(specifier);
                 matches_name && matches_specifier
             })
@@ -254,7 +259,8 @@ mod tests {
 
     #[test]
     fn test_add_and_remove_tag_alias() {
-        let dir = std::env::temp_dir().join(format!("pantagraph_test_alias_{}", uuid::Uuid::now_v7()));
+        let dir =
+            std::env::temp_dir().join(format!("pantagraph_test_alias_{}", uuid::Uuid::now_v7()));
         let store = TomlStore::new(&dir).unwrap();
         let tag = store.create_tag(Tag::new("rust", "Rust lang")).unwrap();
 

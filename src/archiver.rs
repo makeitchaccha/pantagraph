@@ -42,27 +42,18 @@ impl ToolConfig {
     pub fn load_from_file(path: &Path) -> Result<Self> {
         let content = fs::read_to_string(path)
             .with_context(|| format!("Failed to read {}", path.display()))?;
-        let config: ToolConfig =
-            toml::from_str(&content).with_context(|| format!("Failed to parse {}", path.display()))?;
+        let config: ToolConfig = toml::from_str(&content)
+            .with_context(|| format!("Failed to parse {}", path.display()))?;
         Ok(config)
     }
 
     /// Run archiver for a given url and output directory.
-    pub fn execute_archiver(
-        &self,
-        archiver_name: &str,
-        url: &str,
-        outdir: &Path,
-    ) -> Result<()> {
-        let config = self
-            .archiver
-            .get(archiver_name)
-            .ok_or_else(|| anyhow::anyhow!("Archiver '{}' not configured in tool.toml", archiver_name))?;
+    pub fn execute_archiver(&self, archiver_name: &str, url: &str, outdir: &Path) -> Result<()> {
+        let config = self.archiver.get(archiver_name).ok_or_else(|| {
+            anyhow::anyhow!("Archiver '{}' not configured in tool.toml", archiver_name)
+        })?;
 
-        let binary = config
-            .command
-            .as_deref()
-            .unwrap_or(archiver_name);
+        let binary = config.command.as_deref().unwrap_or(archiver_name);
 
         if config.args.is_empty() {
             bail!(
