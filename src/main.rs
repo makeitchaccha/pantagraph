@@ -166,7 +166,7 @@ fn run() -> Result<()> {
     let store = JsonlStore::new(&cli.data_dir)?;
     let config = Config::load_from_dir(store.data_dir())?;
 
-    match cli.command {
+    let result = match cli.command {
         Commands::Tag { command } => match command {
             TagCommands::Create {
                 name,
@@ -229,7 +229,15 @@ fn run() -> Result<()> {
                 entry::handle_entry_tag(&store, entry_id, tag).map(present_entry_result)
             }
         },
+    };
+
+    // Read paths may have kicked off a background cache rebuild. An explicit
+    // opt-in (PANTAGRAPH_WAIT_REBUILD=1) keeps the process alive long enough
+    // to persist the warmed cache for the next invocation.
+    if result.is_ok() && std::env::var("PANTAGRAPH_WAIT_REBUILD").as_deref() == Ok("1") {
+        store.wait_for_rebuild();
     }
+    result
 }
 
 fn present_tag_result(result: tag::TagResult) {

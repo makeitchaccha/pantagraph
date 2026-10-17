@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use crate::cache::{ArchiverFilter, SourceSignature, SqliteCache};
 use crate::domain::{Entry, EntryId, Tag, TagId};
@@ -11,6 +12,9 @@ use anyhow::{bail, Context, Result};
 pub struct JsonlStore {
     data_dir: PathBuf,
     cache: SqliteCache,
+    /// Last full parse of the JSONL, keyed by the source signature, so a cold
+    /// read answers once and stays valid until the data actually changes.
+    entry_memo: Mutex<Option<(SourceSignature, Vec<Entry>)>>,
 }
 
 impl JsonlStore {
@@ -19,11 +23,20 @@ impl JsonlStore {
         std::fs::create_dir_all(&data_dir)
             .with_context(|| format!("Failed to create data directory: {}", data_dir.display()))?;
         let cache = SqliteCache::new(&data_dir);
-        Ok(Self { data_dir, cache })
+        Ok(Self {
+            data_dir,
+            cache,
+            entry_memo: Mutex::new(None),
+        })
     }
 
     pub fn data_dir(&self) -> &std::path::Path {
         &self.data_dir
+    }
+
+    /// Blocks until a background cache rebuild (if any) has settled.
+    pub fn wait_for_rebuild(&self) {
+        self.cache.wait_for_rebuild();
     }
 
     fn tags_path(&self) -> PathBuf {
@@ -227,6 +240,10 @@ impl JsonlStore {
 
     /// Find entries carrying every supplied tag, optionally filtered by archiver.
     /// `Some(None)` selects entries without an archiver.
+    ///
+    /// Reads never wait on a cache build: a warm cache answers directly,
+    /// otherwise the answer is streamed from JSONL immediately while a single
+    /// background thread rebuilds the cache for later callers.
     pub fn find_entries(
         &self,
         tag_ids: &[TagId],
@@ -245,32 +262,31 @@ impl JsonlStore {
             return Ok(entries);
         }
 
-        let tags_path = self.tags_path();
-        let entries_path = self.entries_path();
-        let current_signature = SourceSignature::read(&self.tags_path(), &self.entries_path())?;
-        if signature == current_signature {
-            if let Ok(Some(cached)) = self
-                .cache
-                .rebuild(&signature, &tags_path, &entries_path)
-                .and_then(|()| {
-                    self.cache
-                        .query_entries(&signature, tag_ids, archiver_filter)
-                })
-            {
-                return Ok(cached);
+        {
+            let memo = self.entry_memo.lock().unwrap();
+            if let Some((memo_signature, entries)) = memo.as_ref() {
+                if *memo_signature == signature {
+                    return Ok(filter_entries(
+                        entries.clone(),
+                        tag_ids,
+                        archiver_filter,
+                    ));
+                }
             }
         }
 
         let entries = self.load_entries()?;
-        if signature == SourceSignature::read(&self.tags_path(), &self.entries_path())? {
-            if let Ok(Some(cached)) = self
-                .cache
-                .query_entries(&signature, tag_ids, archiver_filter)
-            {
-                return Ok(cached);
-            }
+        // The reload may have migrated legacy files first, so re-read before
+        // trusting or memoizing against the signature observed initially.
+        let current_signature = SourceSignature::read(&self.tags_path(), &self.entries_path())?;
+        if signature == current_signature {
+            self.cache.rebuild_in_background(
+                current_signature,
+                self.tags_path(),
+                self.entries_path(),
+            );
+            *self.entry_memo.lock().unwrap() = Some((signature, entries.clone()));
         }
-
         Ok(filter_entries(entries, tag_ids, archiver_filter))
     }
 
@@ -462,6 +478,8 @@ mod tests {
         let canonical_tags = std::fs::read(store.tags_path()).unwrap();
         let canonical_entries = std::fs::read(store.entries_path()).unwrap();
         let cached = store.list_entries().unwrap();
+        // The cold read answers from JSONL; the cache rebuild runs in the background.
+        store.cache.wait_for_rebuild();
         assert_eq!(cached[0].tag_ids, vec![second.id, first.id, second.id]);
         assert!(dir.join("cache.sqlite3").exists());
 
