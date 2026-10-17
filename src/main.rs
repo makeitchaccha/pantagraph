@@ -6,7 +6,7 @@ use pantagraph::{archiver, domain, store};
 use std::collections::HashMap;
 
 use anyhow::Result;
-use application::{entry, tag};
+use application::{cache, entry, tag};
 use clap::{Parser, Subcommand};
 use config::Config;
 use domain::{Entry, Tag, TagId};
@@ -38,6 +38,18 @@ enum Commands {
         #[command(subcommand)]
         command: EntryCommands,
     },
+    /// Manage the SQLite search cache
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum CacheCommands {
+    /// Rebuild the cache synchronously to pre-warm cold searches
+    #[command(name = "rebuild")]
+    Rebuild,
 }
 
 #[derive(Subcommand)]
@@ -229,6 +241,11 @@ fn run() -> Result<()> {
                 entry::handle_entry_tag(&store, entry_id, tag).map(present_entry_result)
             }
         },
+        Commands::Cache { command } => match command {
+            CacheCommands::Rebuild => {
+                cache::handle_cache_rebuild(&store).map(present_cache_rebuild)
+            }
+        },
     };
 
     // Read paths may have kicked off a background cache rebuild. An explicit
@@ -238,6 +255,20 @@ fn run() -> Result<()> {
         store.wait_for_rebuild();
     }
     result
+}
+
+fn present_cache_rebuild(outcome: cache::CacheRebuildOutcome) {
+    if outcome.rebuilt {
+        println!("Cache rebuilt in {:.2}s", outcome.elapsed);
+    } else {
+        println!(
+            "Cache already matches current data (checked in {:.2}s), no rebuild needed",
+            outcome.elapsed
+        );
+    }
+    println!("  entries: {}", outcome.entries);
+    println!("  tags: {}", outcome.tags);
+    println!("  size: {:.1} MiB", outcome.bytes as f64 / 1024.0 / 1024.0);
 }
 
 fn present_tag_result(result: tag::TagResult) {

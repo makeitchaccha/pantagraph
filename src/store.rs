@@ -39,6 +39,14 @@ impl JsonlStore {
         self.cache.wait_for_rebuild();
     }
 
+    /// Synchronous cache warm-up for `cache rebuild`: only rebuilds when the
+    /// on-disk cache does not match the current JSONL signature.
+    pub fn warm_cache(&self) -> Result<crate::cache::CacheReport> {
+        let signature = SourceSignature::read(&self.tags_path(), &self.entries_path())?;
+        self.cache
+            .warm(&signature, &self.tags_path(), &self.entries_path())
+    }
+
     fn tags_path(&self) -> PathBuf {
         self.data_dir.join("tags.jsonl")
     }
@@ -456,6 +464,38 @@ mod tests {
         let renamed = store.rename_tag(&tag.id, "rust-lang").unwrap();
         assert_eq!(renamed.name, "rust-lang");
         assert!(renamed.aliases.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_warm_rebuilds_only_when_stale() {
+        let dir =
+            std::env::temp_dir().join(format!("pantagraph_cache_warm_{}", uuid::Uuid::now_v7()));
+        let store = JsonlStore::new(&dir).unwrap();
+        let tag = store.create_tag(Tag::new("alpha", "")).unwrap();
+        store
+            .create_entry(Entry::new("https://warm.example", None, None, "", vec![tag.id]))
+            .unwrap();
+
+        let first = store.warm_cache().unwrap();
+        assert!(first.rebuilt);
+        assert_eq!(first.entries, 1);
+        assert_eq!(first.tags, 1);
+
+        // A second run on the same data must not pay for a rebuild.
+        let second = store.warm_cache().unwrap();
+        assert!(!second.rebuilt);
+        assert_eq!(second.entries, first.entries);
+        assert_eq!(second.tags, first.tags);
+
+        // Writes invalidate the data signature, so the next warm-up rebuilds.
+        store
+            .create_entry(Entry::new("https://warm2.example", None, None, "", vec![tag.id]))
+            .unwrap();
+        let third = store.warm_cache().unwrap();
+        assert!(third.rebuilt);
+        assert_eq!(third.entries, 2);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

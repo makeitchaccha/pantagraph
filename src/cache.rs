@@ -55,6 +55,13 @@ pub(crate) enum ArchiverFilter<'a> {
     Named(&'a str),
 }
 
+pub struct CacheReport {
+    pub rebuilt: bool,
+    pub entries: u64,
+    pub tags: u64,
+    pub bytes: u64,
+}
+
 /// Kept with sentinel pipes (`|id0|id1|`) so `split('|')` parsing stays
 /// unambiguous for empty and missing tags.
 fn tags_column(tag_ids: &[TagId]) -> String {
@@ -154,6 +161,67 @@ impl SqliteCache {
             Ok(handle) => *self.rebuild_handle.lock().unwrap() = Some(handle),
             Err(_) => self.rebuild_in_flight.store(false, Ordering::Release),
         }
+    }
+
+    pub(crate) fn warm(
+        &self,
+        signature: &SourceSignature,
+        tags_path: &Path,
+        entries_path: &Path,
+    ) -> Result<CacheReport> {
+        let rebuilt = !self.is_fresh(signature);
+        if rebuilt {
+            self.rebuild(signature, tags_path, entries_path)?;
+            // The renamed-in file supersedes anything the pool may hold.
+            *self.connection.lock().unwrap() = None;
+        }
+        let connection = Connection::open(&self.path)?;
+        let entries =
+            connection.query_row("SELECT COUNT(*) FROM entries", [], |row| {
+                row.get::<_, i64>(0)
+            })? as u64;
+        let tags = connection.query_row("SELECT COUNT(*) FROM tags", [], |row| {
+            row.get::<_, i64>(0)
+        })? as u64;
+        let bytes = std::fs::metadata(&self.path).map(|meta| meta.len()).unwrap_or(0);
+        Ok(CacheReport {
+            rebuilt,
+            entries,
+            tags,
+            bytes,
+        })
+    }
+
+    /// True when the on-disk cache exists, is current-schema, and was built
+    /// from exactly this source signature.
+    fn is_fresh(&self, signature: &SourceSignature) -> bool {
+        if !self.path.exists() {
+            return false;
+        }
+        let Ok(connection) = Connection::open(&self.path) else {
+            return false;
+        };
+        let state = connection
+            .query_row(
+                "SELECT value FROM cache_meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional();
+        let Ok(state) = state else {
+            return false;
+        };
+        if state.as_deref() != Some(SCHEMA_VERSION) {
+            return false;
+        }
+        let (Ok(cached_tags), Ok(cached_entries)) = (
+            read_meta(&connection, "tags_signature"),
+            read_meta(&connection, "entries_signature"),
+        ) else {
+            return false;
+        };
+        cached_tags.as_deref() == Some(signature.tags.as_str())
+            && cached_entries.as_deref() == Some(signature.entries.as_str())
     }
 
     pub(crate) fn query_entries(
