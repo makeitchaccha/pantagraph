@@ -1,4 +1,4 @@
 pub mod archiver;
-mod cache;
+pub mod db;
 pub mod domain;
 pub mod store;

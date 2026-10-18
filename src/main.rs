@@ -6,7 +6,7 @@ use pantagraph::{archiver, domain, store};
 use std::collections::HashMap;
 
 use anyhow::Result;
-use application::{cache, entry, tag};
+use application::{entry, importexport, tag};
 use clap::{Parser, Subcommand};
 use config::Config;
 use domain::{Entry, Tag, TagId};
@@ -38,18 +38,21 @@ enum Commands {
         #[command(subcommand)]
         command: EntryCommands,
     },
-    /// Manage the SQLite search cache
-    Cache {
-        #[command(subcommand)]
-        command: CacheCommands,
+    /// Export tags and entries to JSONL files (the legacy interchange format)
+    Export {
+        /// Output directory (default: the data directory itself)
+        #[arg(long)]
+        out: Option<String>,
     },
-}
-
-#[derive(Subcommand)]
-enum CacheCommands {
-    /// Rebuild the cache synchronously to pre-warm cold searches
-    #[command(name = "rebuild")]
-    Rebuild,
+    /// Import tags and entries from JSONL files (the legacy interchange format)
+    Import {
+        /// Input directory containing tags.jsonl and entries.jsonl
+        #[arg(long)]
+        from: Option<String>,
+        /// Replace all existing data instead of refusing to touch a non-empty store
+        #[arg(long)]
+        overwrite: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -178,7 +181,7 @@ fn run() -> Result<()> {
     let store = JsonlStore::new(&cli.data_dir)?;
     let config = Config::load_from_dir(store.data_dir())?;
 
-    let result = match cli.command {
+    match cli.command {
         Commands::Tag { command } => match command {
             TagCommands::Create {
                 name,
@@ -241,34 +244,25 @@ fn run() -> Result<()> {
                 entry::handle_entry_tag(&store, entry_id, tag).map(present_entry_result)
             }
         },
-        Commands::Cache { command } => match command {
-            CacheCommands::Rebuild => {
-                cache::handle_cache_rebuild(&store).map(present_cache_rebuild)
-            }
-        },
-    };
-
-    // Read paths may have kicked off a background cache rebuild. An explicit
-    // opt-in (PANTAGRAPH_WAIT_REBUILD=1) keeps the process alive long enough
-    // to persist the warmed cache for the next invocation.
-    if result.is_ok() && std::env::var("PANTAGRAPH_WAIT_REBUILD").as_deref() == Ok("1") {
-        store.wait_for_rebuild();
+        Commands::Export { out } => {
+            let result = importexport::handle_export(&store, out)?;
+            println!(
+                "Exported {} tags and {} entries to {}",
+                result.tag_count,
+                result.entry_count,
+                result.out_dir.display()
+            );
+            Ok(())
+        }
+        Commands::Import { from, overwrite } => {
+            let result = importexport::handle_import(&store, from, overwrite)?;
+            println!(
+                "Imported {} tags and {} entries",
+                result.tag_count, result.entry_count
+            );
+            Ok(())
+        }
     }
-    result
-}
-
-fn present_cache_rebuild(outcome: cache::CacheRebuildOutcome) {
-    if outcome.rebuilt {
-        println!("Cache rebuilt in {:.2}s", outcome.elapsed);
-    } else {
-        println!(
-            "Cache already matches current data (checked in {:.2}s), no rebuild needed",
-            outcome.elapsed
-        );
-    }
-    println!("  entries: {}", outcome.entries);
-    println!("  tags: {}", outcome.tags);
-    println!("  size: {:.1} MiB", outcome.bytes as f64 / 1024.0 / 1024.0);
 }
 
 fn present_tag_result(result: tag::TagResult) {

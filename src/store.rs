@@ -1,602 +1,734 @@
-use std::path::PathBuf;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
 
-use crate::cache::{ArchiverFilter, SourceSignature, SqliteCache};
+use crate::db;
 use crate::domain::{Entry, EntryId, Tag, TagId};
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
+use rusqlite::{params, Connection, OptionalExtension};
 
-/// File-based store using JSON Lines.
-///
-/// All data is read from / written to two files: `tags.jsonl` and `entries.jsonl`
-/// inside the configured data directory.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ArchiverFilter<'a> {
+    Any,
+    WithoutArchiver,
+    Named(&'a str),
+}
+
+fn parse_uuid_id<T: std::str::FromStr>(s: &str) -> rusqlite::Result<T>
+where
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
+    s.parse::<T>().map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })
+}
+
+/// Store backed by SQLite (primary source of truth).
 pub struct JsonlStore {
     data_dir: PathBuf,
-    cache: SqliteCache,
-    /// Last full parse of the JSONL, keyed by the source signature, so a cold
-    /// read answers once and stays valid until the data actually changes.
-    entry_memo: Mutex<Option<(SourceSignature, Vec<Entry>)>>,
+    db_path: PathBuf,
 }
 
 impl JsonlStore {
     pub fn new(data_dir: impl Into<PathBuf>) -> Result<Self> {
         let data_dir = data_dir.into();
         std::fs::create_dir_all(&data_dir)
-            .with_context(|| format!("Failed to create data directory: {}", data_dir.display()))?;
-        let cache = SqliteCache::new(&data_dir);
-        Ok(Self {
-            data_dir,
-            cache,
-            entry_memo: Mutex::new(None),
-        })
+            .with_context(|| format!("Failed to create data directory {}", data_dir.display()))?;
+        let db_path = data_dir.join("store.db");
+        let _conn = db::open_store_db(&db_path)?;
+        Ok(Self { db_path, data_dir })
     }
 
-    pub fn data_dir(&self) -> &std::path::Path {
+    pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }
 
-    /// Blocks until a background cache rebuild (if any) has settled.
-    pub fn wait_for_rebuild(&self) {
-        self.cache.wait_for_rebuild();
+    fn conn(&self) -> Result<Connection> {
+        db::open_store_db(&self.db_path)
     }
-
-    /// Synchronous cache warm-up for `cache rebuild`: only rebuilds when the
-    /// on-disk cache does not match the current JSONL signature.
-    pub fn warm_cache(&self) -> Result<crate::cache::CacheReport> {
-        let signature = SourceSignature::read(&self.tags_path(), &self.entries_path())?;
-        self.cache
-            .warm(&signature, &self.tags_path(), &self.entries_path())
-    }
-
-    fn tags_path(&self) -> PathBuf {
-        self.data_dir.join("tags.jsonl")
-    }
-
-    fn entries_path(&self) -> PathBuf {
-        self.data_dir.join("entries.jsonl")
-    }
-
-    fn migrate_legacy_file(&self, jsonl_path: &PathBuf, legacy_name: &str) -> Result<()> {
-        if jsonl_path.exists() {
-            return Ok(());
-        }
-        let legacy_path = self.data_dir.join(legacy_name);
-        if !legacy_path.exists() {
-            return Ok(());
-        }
-        let content = std::fs::read_to_string(&legacy_path)
-            .with_context(|| format!("Failed to read {}", legacy_path.display()))?;
-        let values: Vec<serde_json::Value> = if content.trim().is_empty() {
-            Vec::new()
-        } else {
-            let root: serde_json::Value = toml::from_str::<toml::Value>(&content)
-                .with_context(|| format!("Failed to parse {}", legacy_path.display()))?
-                .try_into()
-                .context("Failed to convert legacy TOML data")?;
-            let key = if legacy_name == "tags.toml" {
-                "tags"
-            } else {
-                "entries"
-            };
-            serde_json::from_value::<serde_json::Map<String, serde_json::Value>>(root)
-                .context("Invalid legacy TOML data")?
-                .get(key)
-                .and_then(serde_json::Value::as_array)
-                .cloned()
-                .unwrap_or_default()
-        };
-        let lines = values
-            .iter()
-            .map(serde_json::to_string)
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        std::fs::write(
-            jsonl_path,
-            lines.join("\n") + if lines.is_empty() { "" } else { "\n" },
-        )
-        .with_context(|| format!("Failed to write {}", jsonl_path.display()))
-    }
-
-    fn load_tags(&self) -> Result<Vec<Tag>> {
-        let path = self.tags_path();
-        self.migrate_legacy_file(&path, "tags.toml")?;
-        load_jsonl(&path)
-    }
-
-    fn save_tags(&self, tags: &[Tag]) -> Result<()> {
-        save_jsonl(&self.tags_path(), tags)
-    }
-
-    fn load_entries(&self) -> Result<Vec<Entry>> {
-        let path = self.entries_path();
-        self.migrate_legacy_file(&path, "entries.toml")?;
-        load_jsonl(&path)
-    }
-
-    fn save_entries(&self, entries: &[Entry]) -> Result<()> {
-        save_jsonl(&self.entries_path(), entries)
-    }
-
-    // ── Tag operations ──────────────────────────────────────────────
 
     pub fn create_tag(&self, tag: Tag) -> Result<Tag> {
-        let mut tags = self.load_tags()?;
-        tags.push(tag.clone());
-        self.save_tags(&tags)?;
-        self.cache.invalidate();
+        let conn = self.conn()?;
+        let aliases = serde_json::to_string(&tag.aliases).context("Failed to serialize aliases")?;
+        conn.execute(
+            "INSERT INTO tags (id, name, specifier, description, aliases) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                tag.id.to_string(),
+                tag.name,
+                tag.specifier,
+                tag.description,
+                aliases
+            ],
+        )
+        .context("Failed to insert tag")?;
         Ok(tag)
     }
 
     pub fn list_tags(&self) -> Result<Vec<Tag>> {
-        self.load_tags()
+        let conn = self.conn()?;
+        let mut stmt =
+            conn.prepare("SELECT id, name, specifier, description, aliases FROM tags")?;
+        let rows = stmt.query_map([], |row| {
+            let id_str: String = row.get(0)?;
+            let name: String = row.get(1)?;
+            let specifier: Option<String> = row.get(2)?;
+            let description: String = row.get(3)?;
+            let aliases_json: String = row.get(4)?;
+            let aliases: Vec<String> = serde_json::from_str(&aliases_json).unwrap_or_default();
+            let id = parse_uuid_id::<TagId>(&id_str)?;
+            Ok(Tag {
+                id,
+                name,
+                specifier,
+                description,
+                aliases,
+            })
+        })?;
+        let mut tags = Vec::new();
+        for r in rows {
+            tags.push(r?);
+        }
+        Ok(tags)
     }
-
     pub fn rename_tag(&self, id: &TagId, new_name: &str) -> Result<Tag> {
-        let mut tags = self.load_tags()?;
-        let tag = tags
-            .iter_mut()
-            .find(|t| t.id == *id)
+        let conn = self.conn()?;
+        let tx = conn.unchecked_transaction()?;
+        let mut tag = tx
+            .query_row(
+                "SELECT id, name, specifier, description, aliases FROM tags WHERE id = ?1",
+                params![id.to_string()],
+                |row| {
+                    let id_str: String = row.get(0)?;
+                    let name: String = row.get(1)?;
+                    let specifier: Option<String> = row.get(2)?;
+                    let description: String = row.get(3)?;
+                    let aliases_json: String = row.get(4)?;
+                    let aliases: Vec<String> =
+                        serde_json::from_str(&aliases_json).unwrap_or_default();
+                    let tid = parse_uuid_id::<TagId>(&id_str)?;
+                    Ok(Tag {
+                        id: tid,
+                        name,
+                        specifier,
+                        description,
+                        aliases,
+                    })
+                },
+            )
+            .optional()?
             .context("Tag not found")?;
         tag.name = new_name.to_string();
         tag.aliases.retain(|a| a != new_name);
-        let updated = tag.clone();
-        self.save_tags(&tags)?;
-        self.cache.invalidate();
-        Ok(updated)
+        let aliases = serde_json::to_string(&tag.aliases)?;
+        tx.execute(
+            "UPDATE tags SET name = ?1, aliases = ?2 WHERE id = ?3",
+            params![tag.name, aliases, tag.id.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(tag)
     }
-
     #[allow(dead_code)]
     pub fn find_tags_by_name(&self, name: &str) -> Result<Vec<Tag>> {
-        let tags = self.load_tags()?;
-        Ok(tags.into_iter().filter(|t| t.name == name).collect())
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, specifier, description, aliases FROM tags WHERE name = ?1",
+        )?;
+        let rows = stmt.query_map(params![name], |row| {
+            let id_str: String = row.get(0)?;
+            let name: String = row.get(1)?;
+            let specifier: Option<String> = row.get(2)?;
+            let description: String = row.get(3)?;
+            let aliases_json: String = row.get(4)?;
+            let aliases: Vec<String> = serde_json::from_str(&aliases_json).unwrap_or_default();
+            let id = parse_uuid_id::<TagId>(&id_str)?;
+            Ok(Tag {
+                id,
+                name,
+                specifier,
+                description,
+                aliases,
+            })
+        })?;
+        let mut tags = Vec::new();
+        for r in rows {
+            tags.push(r?);
+        }
+        Ok(tags)
     }
 
     pub fn find_tags_by_name_or_alias(&self, query: &str) -> Result<Vec<Tag>> {
-        let tags = self.load_tags()?;
-        Ok(tags
-            .into_iter()
-            .filter(|t| t.name == query || t.aliases.iter().any(|a| a == query))
-            .collect())
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, specifier, description, aliases FROM tags WHERE name = ?1 OR aliases LIKE ?2",
+        )?;
+        let rows = stmt.query_map(params![query, format!("%\"{}\"%", query)], |row| {
+            let id_str: String = row.get(0)?;
+            let name: String = row.get(1)?;
+            let specifier: Option<String> = row.get(2)?;
+            let description: String = row.get(3)?;
+            let aliases_json: String = row.get(4)?;
+            let aliases: Vec<String> = serde_json::from_str(&aliases_json).unwrap_or_default();
+            let id = parse_uuid_id::<TagId>(&id_str)?;
+            Ok(Tag {
+                id,
+                name,
+                specifier,
+                description,
+                aliases,
+            })
+        })?;
+        let mut tags = Vec::new();
+        for r in rows {
+            tags.push(r?);
+        }
+        Ok(tags)
     }
-
     pub fn find_tags_by_name_and_specifier(
         &self,
         name_or_alias: &str,
         specifier: &str,
     ) -> Result<Vec<Tag>> {
-        let tags = self.load_tags()?;
-        Ok(tags
-            .into_iter()
-            .filter(|t| {
-                let matches_name =
-                    t.name == name_or_alias || t.aliases.iter().any(|a| a == name_or_alias);
-                let matches_specifier = t.specifier.as_deref() == Some(specifier);
-                matches_name && matches_specifier
-            })
-            .collect())
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, specifier, description, aliases FROM tags WHERE (name = ?1 OR aliases LIKE ?2) AND specifier = ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![name_or_alias, format!("%\"{}\"%", name_or_alias), specifier],
+            |row| {
+                let id_str: String = row.get(0)?;
+                let name: String = row.get(1)?;
+                let specifier: Option<String> = row.get(2)?;
+                let description: String = row.get(3)?;
+                let aliases_json: String = row.get(4)?;
+                let aliases: Vec<String> = serde_json::from_str(&aliases_json).unwrap_or_default();
+                let id = parse_uuid_id::<TagId>(&id_str)?;
+                Ok(Tag {
+                    id,
+                    name,
+                    specifier,
+                    description,
+                    aliases,
+                })
+            },
+        )?;
+        let mut tags = Vec::new();
+        for r in rows {
+            tags.push(r?);
+        }
+        Ok(tags)
     }
 
     pub fn find_tag_by_id(&self, id: &TagId) -> Result<Option<Tag>> {
-        let tags = self.load_tags()?;
-        Ok(tags.into_iter().find(|t| t.id == *id))
+        let conn = self.conn()?;
+        let tag = conn
+            .query_row(
+                "SELECT id, name, specifier, description, aliases FROM tags WHERE id = ?1",
+                params![id.to_string()],
+                |row| {
+                    let id_str: String = row.get(0)?;
+                    let name: String = row.get(1)?;
+                    let specifier: Option<String> = row.get(2)?;
+                    let description: String = row.get(3)?;
+                    let aliases_json: String = row.get(4)?;
+                    let aliases: Vec<String> =
+                        serde_json::from_str(&aliases_json).unwrap_or_default();
+                    let tid = parse_uuid_id::<TagId>(&id_str)?;
+                    Ok(Tag {
+                        id: tid,
+                        name,
+                        specifier,
+                        description,
+                        aliases,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(tag)
     }
-
     pub fn add_tag_alias(&self, id: &TagId, alias: &str) -> Result<Tag> {
-        let alias = alias.trim();
-        if alias.is_empty() {
-            bail!("Alias cannot be empty");
-        }
-        let mut tags = self.load_tags()?;
-        let tag = tags
-            .iter_mut()
-            .find(|t| t.id == *id)
+        let conn = self.conn()?;
+        let tx = conn.unchecked_transaction()?;
+        let mut tag = tx
+            .query_row(
+                "SELECT id, name, specifier, description, aliases FROM tags WHERE id = ?1",
+                params![id.to_string()],
+                |row| {
+                    let id_str: String = row.get(0)?;
+                    let name: String = row.get(1)?;
+                    let specifier: Option<String> = row.get(2)?;
+                    let description: String = row.get(3)?;
+                    let aliases_json: String = row.get(4)?;
+                    let aliases: Vec<String> =
+                        serde_json::from_str(&aliases_json).unwrap_or_default();
+                    let tid = parse_uuid_id::<TagId>(&id_str)?;
+                    Ok(Tag {
+                        id: tid,
+                        name,
+                        specifier,
+                        description,
+                        aliases,
+                    })
+                },
+            )
+            .optional()?
             .context("Tag not found")?;
-        if tag.name == alias {
-            bail!("Alias cannot be identical to the tag name");
+        if !tag.aliases.iter().any(|a| a == alias) {
+            tag.aliases.push(alias.to_string());
         }
-        if tag.aliases.iter().any(|a| a == alias) {
-            bail!("Tag already has alias '{}'", alias);
-        }
-        tag.aliases.push(alias.to_string());
-        let updated = tag.clone();
-        self.save_tags(&tags)?;
-        self.cache.invalidate();
-        Ok(updated)
+        let aliases = serde_json::to_string(&tag.aliases)?;
+        tx.execute(
+            "UPDATE tags SET aliases = ?1 WHERE id = ?2",
+            params![aliases, tag.id.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(tag)
     }
 
     pub fn remove_tag_alias(&self, id: &TagId, alias: &str) -> Result<Tag> {
-        let alias = alias.trim();
-        let mut tags = self.load_tags()?;
-        let tag = tags
-            .iter_mut()
-            .find(|t| t.id == *id)
+        let conn = self.conn()?;
+        let tx = conn.unchecked_transaction()?;
+        let mut tag = tx
+            .query_row(
+                "SELECT id, name, specifier, description, aliases FROM tags WHERE id = ?1",
+                params![id.to_string()],
+                |row| {
+                    let id_str: String = row.get(0)?;
+                    let name: String = row.get(1)?;
+                    let specifier: Option<String> = row.get(2)?;
+                    let description: String = row.get(3)?;
+                    let aliases_json: String = row.get(4)?;
+                    let aliases: Vec<String> =
+                        serde_json::from_str(&aliases_json).unwrap_or_default();
+                    let tid = parse_uuid_id::<TagId>(&id_str)?;
+                    Ok(Tag {
+                        id: tid,
+                        name,
+                        specifier,
+                        description,
+                        aliases,
+                    })
+                },
+            )
+            .optional()?
             .context("Tag not found")?;
-        let pos = tag
-            .aliases
-            .iter()
-            .position(|a| a == alias)
-            .with_context(|| format!("Alias '{}' not found on tag '{}'", alias, tag.name))?;
-        tag.aliases.remove(pos);
-        let updated = tag.clone();
-        self.save_tags(&tags)?;
-        self.cache.invalidate();
-        Ok(updated)
+        tag.aliases.retain(|a| a != alias);
+        let aliases = serde_json::to_string(&tag.aliases)?;
+        tx.execute(
+            "UPDATE tags SET aliases = ?1 WHERE id = ?2",
+            params![aliases, tag.id.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(tag)
     }
-
-    // ── Entry operations ────────────────────────────────────────────
-
     pub fn create_entry(&self, entry: Entry) -> Result<Entry> {
-        let mut entries = self.load_entries()?;
-        entries.push(entry.clone());
-        self.save_entries(&entries)?;
-        self.cache.invalidate();
+        let conn = self.conn()?;
+        let tx = conn.unchecked_transaction()?;
+        let ordinal: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM entries",
+            [],
+            |row| row.get(0),
+        )?;
+        tx.execute(
+            "INSERT INTO entries (id, url, archiver, archive_path, description, ordinal) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                entry.id.to_string(),
+                entry.url,
+                entry.archiver,
+                entry.archive_path,
+                entry.description,
+                ordinal
+            ],
+        )?;
+        let entry_id_str = entry.id.to_string();
+        for tid in &entry.tag_ids {
+            tx.execute(
+                "INSERT OR IGNORE INTO entry_tags (entry_id, tag_id) VALUES (?1, ?2)",
+                params![entry_id_str, tid.to_string()],
+            )?;
+        }
+        tx.commit()?;
         Ok(entry)
     }
-
+    fn load_entry_with_tags(
+        &self,
+        conn: &Connection,
+        entry_row: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<Entry> {
+        let id_str: String = entry_row.get(0)?;
+        let url: String = entry_row.get(1)?;
+        let archiver: Option<String> = entry_row.get(2)?;
+        let archive_path: Option<String> = entry_row.get(3)?;
+        let description: String = entry_row.get(4)?;
+        let _ordinal: i64 = entry_row.get(5)?;
+        let id = parse_uuid_id::<EntryId>(&id_str)?;
+        let mut stmt = conn.prepare("SELECT tag_id FROM entry_tags WHERE entry_id = ?1")?;
+        let mut tag_ids = Vec::new();
+        let rows = stmt.query_map(params![id.to_string()], |r| {
+            let t: String = r.get(0)?;
+            Ok(t)
+        })?;
+        for r in rows {
+            let ts = r?;
+            if let Ok(tid) = ts.parse::<TagId>() {
+                tag_ids.push(tid);
+            }
+        }
+        Ok(Entry {
+            id,
+            url,
+            archiver,
+            archive_path,
+            description,
+            tag_ids,
+        })
+    }
     pub fn list_entries(&self) -> Result<Vec<Entry>> {
         self.find_entries(&[], None)
     }
 
     pub fn find_entry_by_id(&self, id: &EntryId) -> Result<Option<Entry>> {
-        Ok(self
-            .list_entries()?
-            .into_iter()
-            .find(|entry| entry.id == *id))
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, url, archiver, archive_path, description, ordinal FROM entries WHERE id = ?1",
+        )?;
+        let entry = stmt
+            .query_row(params![id.to_string()], |row| {
+                self.load_entry_with_tags(&conn, row)
+            })
+            .optional()?;
+        Ok(entry)
     }
 
     pub fn find_entries_by_tag(&self, tag_id: &TagId) -> Result<Vec<Entry>> {
         self.find_entries(&[*tag_id], None)
     }
-
-    /// Find entries carrying every supplied tag, optionally filtered by archiver.
-    /// `Some(None)` selects entries without an archiver.
-    ///
-    /// Reads never wait on a cache build: a warm cache answers directly,
-    /// otherwise the answer is streamed from JSONL immediately while a single
-    /// background thread rebuilds the cache for later callers.
     pub fn find_entries(
         &self,
         tag_ids: &[TagId],
         archiver: Option<Option<&str>>,
     ) -> Result<Vec<Entry>> {
-        let signature = SourceSignature::read(&self.tags_path(), &self.entries_path())?;
+        let conn = self.conn()?;
         let archiver_filter = match archiver {
             None => ArchiverFilter::Any,
             Some(None) => ArchiverFilter::WithoutArchiver,
             Some(Some(name)) => ArchiverFilter::Named(name),
         };
-        if let Ok(Some(entries)) = self
-            .cache
-            .query_entries(&signature, tag_ids, archiver_filter)
-        {
-            return Ok(entries);
-        }
+        let tag_ids_str: Vec<String> = tag_ids.iter().map(|t| t.to_string()).collect();
+        let mut entries: Vec<Entry> = if tag_ids.is_empty() {
+            let mut stmt = conn.prepare(
+                "SELECT id, url, archiver, archive_path, description, ordinal FROM entries ORDER BY ordinal",
+            )?;
+            let rows = stmt.query_map([], |row| self.load_entry_with_tags(&conn, row))?;
+            let mut v = Vec::new();
+            for r in rows {
+                v.push(r?);
+            }
+            v
+        } else {
+            let placeholders: Vec<String> = (0..tag_ids_str.len())
+                .map(|i| format!("?{}", i + 1))
+                .collect();
+            let sql = format!(
+                "SELECT e.id, e.url, e.archiver, e.archive_path, e.description, e.ordinal
+                 FROM entries e
+                 JOIN entry_tags et ON et.entry_id = e.id
+                 WHERE et.tag_id IN ({})
+                 GROUP BY e.id
+                 HAVING COUNT(DISTINCT et.tag_id) = {}
+                 ORDER BY e.ordinal",
+                placeholders.join(","),
+                tag_ids_str.len()
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut params_vec: Vec<rusqlite::types::Value> = Vec::new();
+            for s in &tag_ids_str {
+                params_vec.push(rusqlite::types::Value::Text(s.clone()));
+            }
+            let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| {
+                self.load_entry_with_tags(&conn, row)
+            })?;
+            let mut v = Vec::new();
+            for r in rows {
+                v.push(r?);
+            }
+            v
+        };
 
+        match archiver_filter {
+            ArchiverFilter::Any => {}
+            ArchiverFilter::WithoutArchiver => {
+                entries.retain(|e| e.archiver.is_none());
+            }
+            ArchiverFilter::Named(name) => {
+                entries.retain(|e| e.archiver.as_deref() == Some(name));
+            }
+        }
+        Ok(entries)
+    }
+    pub fn add_tag_to_entry(&self, entry_id: &EntryId, tag_id: &TagId) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT OR IGNORE INTO entry_tags (entry_id, tag_id) VALUES (?1, ?2)",
+            params![entry_id.to_string(), tag_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// True when the store holds no tags and no entries.
+    pub fn is_empty(&self) -> Result<bool> {
+        let conn = self.conn()?;
+        let tag_count: i64 = conn.query_row("SELECT COUNT(*) FROM tags", [], |r| r.get(0))?;
+        let entry_count: i64 = conn.query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0))?;
+        Ok(tag_count == 0 && entry_count == 0)
+    }
+
+    /// Delete all tags, entries, and their links.
+    pub fn clear_all(&self) -> Result<()> {
+        let conn = self.conn()?;
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM entry_tags", [])?;
+        tx.execute("DELETE FROM entries", [])?;
+        tx.execute("DELETE FROM tags", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Bulk insert tags and entries in a single transaction.
+    ///
+    /// Entry `ordinal` is assigned by slice order (`0..n`), preserving the
+    /// order of the source JSONL file. Entry `tag_ids` referencing unknown
+    /// tags (possible in legacy JSONL files) are skipped rather than failing
+    /// the import; duplicate links are ignored via `INSERT OR IGNORE`.
+    pub fn import_bulk(&self, tags: &[Tag], entries: &[Entry]) -> Result<()> {
+        let conn = self.conn()?;
+        let tx = conn.unchecked_transaction()?;
         {
-            let memo = self.entry_memo.lock().unwrap();
-            if let Some((memo_signature, entries)) = memo.as_ref() {
-                if *memo_signature == signature {
-                    return Ok(filter_entries(
-                        entries.clone(),
-                        tag_ids,
-                        archiver_filter,
-                    ));
+            let mut stmt = tx.prepare(
+                "INSERT INTO tags (id, name, specifier, description, aliases) VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for tag in tags {
+                let aliases =
+                    serde_json::to_string(&tag.aliases).context("Failed to serialize aliases")?;
+                stmt.execute(params![
+                    tag.id.to_string(),
+                    tag.name,
+                    tag.specifier,
+                    tag.description,
+                    aliases
+                ])?;
+            }
+        }
+        {
+            let mut entry_stmt = tx.prepare(
+                "INSERT INTO entries (id, url, archiver, archive_path, description, ordinal) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            let mut link_stmt =
+                tx.prepare("INSERT OR IGNORE INTO entry_tags (entry_id, tag_id) VALUES (?1, ?2)")?;
+            let mut tag_exists_stmt = tx.prepare("SELECT 1 FROM tags WHERE id = ?1")?;
+            for (ordinal, entry) in entries.iter().enumerate() {
+                entry_stmt.execute(params![
+                    entry.id.to_string(),
+                    entry.url,
+                    entry.archiver,
+                    entry.archive_path,
+                    entry.description,
+                    ordinal as i64
+                ])?;
+                let entry_id = entry.id.to_string();
+                for tag_id in &entry.tag_ids {
+                    let tag_id_str = tag_id.to_string();
+                    let known: bool = tag_exists_stmt
+                        .query_row(params![tag_id_str], |_| Ok(true))
+                        .unwrap_or(false);
+                    if known {
+                        link_stmt.execute(params![entry_id, tag_id_str])?;
+                    }
                 }
             }
         }
-
-        let entries = self.load_entries()?;
-        // The reload may have migrated legacy files first, so re-read before
-        // trusting or memoizing against the signature observed initially.
-        let current_signature = SourceSignature::read(&self.tags_path(), &self.entries_path())?;
-        if signature == current_signature {
-            self.cache.rebuild_in_background(
-                current_signature,
-                self.tags_path(),
-                self.entries_path(),
-            );
-            *self.entry_memo.lock().unwrap() = Some((signature, entries.clone()));
-        }
-        Ok(filter_entries(entries, tag_ids, archiver_filter))
-    }
-
-    pub fn add_tag_to_entry(&self, entry_id: &EntryId, tag_id: &TagId) -> Result<()> {
-        let mut entries = self.load_entries()?;
-        let entry = entries
-            .iter_mut()
-            .find(|e| e.id == *entry_id)
-            .context("Entry not found")?;
-        if !entry.tag_ids.contains(tag_id) {
-            entry.tag_ids.push(*tag_id);
-        }
-        self.save_entries(&entries)?;
-        self.cache.invalidate();
+        tx.commit()?;
         Ok(())
     }
-}
-
-fn filter_entries(
-    mut entries: Vec<Entry>,
-    tag_ids: &[TagId],
-    archiver: ArchiverFilter<'_>,
-) -> Vec<Entry> {
-    entries.retain(|entry| {
-        let matches_archiver = match archiver {
-            ArchiverFilter::Any => true,
-            ArchiverFilter::WithoutArchiver => entry.archiver.is_none(),
-            ArchiverFilter::Named(name) => entry.archiver.as_deref() == Some(name),
-        };
-        matches_archiver && tag_ids.iter().all(|tag_id| entry.tag_ids.contains(tag_id))
-    });
-    entries
-}
-
-fn load_jsonl<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Result<Vec<T>> {
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read {}", path.display()))?;
-    content
-        .lines()
-        .enumerate()
-        .filter(|(_, line)| !line.trim().is_empty())
-        .map(|(index, line)| {
-            serde_json::from_str(line).with_context(|| {
-                format!("Failed to parse {} at line {}", path.display(), index + 1)
-            })
-        })
-        .collect()
-}
-
-fn save_jsonl<T: serde::Serialize>(path: &std::path::Path, values: &[T]) -> Result<()> {
-    let mut content = String::new();
-    for value in values {
-        content
-            .push_str(&serde_json::to_string(value).context("Failed to serialize JSONL record")?);
-        content.push('\n');
-    }
-    std::fs::write(path, content).with_context(|| format!("Failed to write {}", path.display()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_rename_tag() {
-        let dir = std::env::temp_dir().join(format!("pantagraph_test_{}", uuid::Uuid::now_v7()));
+    fn temp_store(tag: &str) -> (JsonlStore, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "pantagraph_test_store_{tag}_{}",
+            uuid::Uuid::now_v7()
+        ));
         let store = JsonlStore::new(&dir).unwrap();
-        let tag = store.create_tag(Tag::new("old_name", "desc")).unwrap();
-
-        let updated = store.rename_tag(&tag.id, "new_name").unwrap();
-        assert_eq!(updated.name, "new_name");
-        assert_eq!(updated.description, "desc");
-        assert_eq!(updated.id, tag.id);
-
-        let fetched = store.find_tag_by_id(&tag.id).unwrap().unwrap();
-        assert_eq!(fetched.name, "new_name");
-
-        let _ = std::fs::remove_dir_all(&dir);
+        (store, dir)
     }
 
     #[test]
-    fn migrates_legacy_toml_to_jsonl_without_removing_source() {
-        let dir = std::env::temp_dir().join(format!("pantagraph_migrate_{}", uuid::Uuid::now_v7()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let tag = Tag::new("legacy", "from toml");
-        let entry = Entry::new("https://legacy.example", None, None, "old", vec![tag.id]);
-        let tags_toml = format!(
-            "[[tags]]\nid = \"{}\"\nname = \"{}\"\ndescription = \"{}\"\naliases = []\n",
-            tag.id, tag.name, tag.description
-        );
-        let entries_toml = format!(
-            "[[entries]]\nid = \"{}\"\nurl = \"{}\"\ndescription = \"{}\"\ntag_ids = [\"{}\"]\n",
-            entry.id, entry.url, entry.description, tag.id
-        );
-        std::fs::write(dir.join("tags.toml"), tags_toml).unwrap();
-        std::fs::write(dir.join("entries.toml"), entries_toml).unwrap();
+    fn test_tag_crud() {
+        let (store, dir) = temp_store("tag_crud");
 
-        let store = JsonlStore::new(&dir).unwrap();
-        assert_eq!(store.list_tags().unwrap()[0].name, "legacy");
-        assert_eq!(
-            store.list_entries().unwrap()[0].url,
-            "https://legacy.example"
-        );
-        assert!(dir.join("tags.jsonl").exists());
-        assert!(dir.join("entries.jsonl").exists());
-        assert!(dir.join("tags.toml").exists());
-        assert!(dir.join("entries.toml").exists());
+        let created = store.create_tag(Tag::new("rust", "lang")).unwrap();
+        let found = store.find_tag_by_id(&created.id).unwrap().unwrap();
+        assert_eq!(found.name, "rust");
+        assert_eq!(found.description, "lang");
+        assert!(found.aliases.is_empty());
+        assert!(found.specifier.is_none());
 
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+        assert_eq!(store.list_tags().unwrap().len(), 1);
 
-    #[test]
-    fn test_rename_nonexistent_tag() {
-        let dir = std::env::temp_dir().join(format!("pantagraph_test_{}", uuid::Uuid::now_v7()));
-        let store = JsonlStore::new(&dir).unwrap();
-        let fake_id = TagId::new();
-
-        assert!(store.rename_tag(&fake_id, "new_name").is_err());
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn test_add_and_remove_tag_alias() {
-        let dir =
-            std::env::temp_dir().join(format!("pantagraph_test_alias_{}", uuid::Uuid::now_v7()));
-        let store = JsonlStore::new(&dir).unwrap();
-        let tag = store.create_tag(Tag::new("rust", "Rust lang")).unwrap();
-
-        // Add alias
-        let updated = store.add_tag_alias(&tag.id, "rs").unwrap();
-        assert_eq!(updated.aliases, vec!["rs"]);
-
-        // Cannot add duplicate alias
-        assert!(store.add_tag_alias(&tag.id, "rs").is_err());
-
-        // Cannot add empty alias
-        assert!(store.add_tag_alias(&tag.id, "  ").is_err());
-
-        // Cannot add alias matching tag name
-        assert!(store.add_tag_alias(&tag.id, "rust").is_err());
-
-        // Add second alias
-        let updated2 = store.add_tag_alias(&tag.id, "rust-lang").unwrap();
-        assert_eq!(updated2.aliases, vec!["rs", "rust-lang"]);
-
-        // Find by alias
-        let found = store.find_tags_by_name_or_alias("rs").unwrap();
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].id, tag.id);
-
-        let found_by_name = store.find_tags_by_name_or_alias("rust").unwrap();
-        assert_eq!(found_by_name.len(), 1);
-        assert_eq!(found_by_name[0].id, tag.id);
-
-        // Remove alias
-        let after_remove = store.remove_tag_alias(&tag.id, "rs").unwrap();
-        assert_eq!(after_remove.aliases, vec!["rust-lang"]);
-
-        // Removing non-existent alias errors
-        assert!(store.remove_tag_alias(&tag.id, "rs").is_err());
-
-        // Renaming to existing alias removes it from aliases
-        let renamed = store.rename_tag(&tag.id, "rust-lang").unwrap();
+        let renamed = store.rename_tag(&created.id, "rust-lang").unwrap();
         assert_eq!(renamed.name, "rust-lang");
-        assert!(renamed.aliases.is_empty());
+        assert_eq!(
+            store.find_tag_by_id(&created.id).unwrap().unwrap().name,
+            "rust-lang"
+        );
+
+        let with_alias = store.add_tag_alias(&created.id, "rs").unwrap();
+        assert_eq!(with_alias.aliases, vec!["rs".to_string()]);
+        assert_eq!(store.find_tags_by_name_or_alias("rs").unwrap().len(), 1);
+
+        let removed = store.remove_tag_alias(&created.id, "rs").unwrap();
+        assert!(removed.aliases.is_empty());
+        assert!(store.find_tags_by_name_or_alias("rs").unwrap().is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn cache_warm_rebuilds_only_when_stale() {
-        let dir =
-            std::env::temp_dir().join(format!("pantagraph_cache_warm_{}", uuid::Uuid::now_v7()));
-        let store = JsonlStore::new(&dir).unwrap();
-        let tag = store.create_tag(Tag::new("alpha", "")).unwrap();
-        store
-            .create_entry(Entry::new("https://warm.example", None, None, "", vec![tag.id]))
-            .unwrap();
+    fn test_find_tags_by_specifier() {
+        let (store, dir) = temp_store("tag_spec");
+        let tag = Tag::with_specifier("game", Some("jp".to_string()), "games", vec![]);
+        let id = store.create_tag(tag).unwrap().id;
 
-        let first = store.warm_cache().unwrap();
-        assert!(first.rebuilt);
-        assert_eq!(first.entries, 1);
-        assert_eq!(first.tags, 1);
+        assert_eq!(
+            store
+                .find_tags_by_name_and_specifier("game", "jp")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(store
+            .find_tags_by_name_and_specifier("game", "en")
+            .unwrap()
+            .is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = id;
+    }
 
-        // A second run on the same data must not pay for a rebuild.
-        let second = store.warm_cache().unwrap();
-        assert!(!second.rebuilt);
-        assert_eq!(second.entries, first.entries);
-        assert_eq!(second.tags, first.tags);
+    #[test]
+    fn test_entry_crud_and_ordering() {
+        let (store, dir) = temp_store("entry_crud");
+        let tag = store.create_tag(Tag::new("t", "d")).unwrap();
+        let tag_id = tag.id;
 
-        // Writes invalidate the data signature, so the next warm-up rebuilds.
-        store
-            .create_entry(Entry::new("https://warm2.example", None, None, "", vec![tag.id]))
-            .unwrap();
-        let third = store.warm_cache().unwrap();
-        assert!(third.rebuilt);
-        assert_eq!(third.entries, 2);
+        let e1 = Entry::new(
+            "https://a.test",
+            Some("curl".to_string()),
+            Some("archives/a.html".to_string()),
+            "first",
+            vec![tag_id],
+        );
+        let e2 = Entry::new("https://b.test", None, None, "second", vec![]);
+        let e3 = Entry::new("https://c.test", None, None, "third", vec![tag_id]);
+
+        let id1 = store.create_entry(e1).unwrap().id;
+        let id2 = store.create_entry(e2).unwrap().id;
+        let id3 = store.create_entry(e3).unwrap().id;
+
+        // list_entries preserves insertion (ordinal) order
+        let all = store.list_entries().unwrap();
+        assert_eq!(
+            all.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![id1, id2, id3]
+        );
+
+        // find_entry_by_id loads tags
+        let found = store.find_entry_by_id(&id1).unwrap().unwrap();
+        assert_eq!(found.url, "https://a.test");
+        assert_eq!(found.archiver.as_deref(), Some("curl"));
+        assert_eq!(found.tag_ids, vec![tag_id]);
+        assert!(store.find_entry_by_id(&EntryId::new()).unwrap().is_none());
+
+        // find_entries_by_tag
+        let by_tag = store.find_entries_by_tag(&tag_id).unwrap();
+        assert_eq!(
+            by_tag.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![id1, id3]
+        );
+
+        // archiver filters
+        let no_archiver = store.find_entries(&[], Some(None)).unwrap();
+        assert_eq!(
+            no_archiver.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![id2, id3]
+        );
+        let curl = store.find_entries(&[], Some(Some("curl"))).unwrap();
+        assert_eq!(curl.iter().map(|e| e.id).collect::<Vec<_>>(), vec![id1]);
+
+        // add_tag_to_entry
+        store.add_tag_to_entry(&id2, &tag_id).unwrap();
+        // idempotent
+        store.add_tag_to_entry(&id2, &tag_id).unwrap();
+        assert_eq!(store.find_entries_by_tag(&tag_id).unwrap().len(), 3);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn cache_build_preserves_tag_order_and_rebuilds_without_touching_jsonl() {
-        let dir = std::env::temp_dir().join(format!("pantagraph_cache_{}", uuid::Uuid::now_v7()));
-        let store = JsonlStore::new(&dir).unwrap();
-        let first = store.create_tag(Tag::new("first", "")).unwrap();
-        let second = store.create_tag(Tag::new("second", "")).unwrap();
+    fn test_is_empty_clear_all_import_bulk() {
+        let (store, dir) = temp_store("bulk");
+        assert!(store.is_empty().unwrap());
+
+        let tag = Tag::with_aliases("t", "d", vec!["a".to_string()]);
+        let tag_id = tag.id;
         let entry = Entry::new(
-            "https://cache.example",
+            "https://x.test",
             None,
             None,
-            "cached",
-            vec![second.id, first.id, second.id],
+            "e",
+            vec![tag_id, TagId::new()],
         );
-        let entry = store.create_entry(entry).unwrap();
+        store
+            .import_bulk(&[tag], std::slice::from_ref(&entry))
+            .unwrap();
 
-        let canonical_tags = std::fs::read(store.tags_path()).unwrap();
-        let canonical_entries = std::fs::read(store.entries_path()).unwrap();
-        let cached = store.list_entries().unwrap();
-        // The cold read answers from JSONL; the cache rebuild runs in the background.
-        store.cache.wait_for_rebuild();
-        assert_eq!(cached[0].tag_ids, vec![second.id, first.id, second.id]);
-        assert!(dir.join("cache.sqlite3").exists());
+        assert!(!store.is_empty().unwrap());
+        let tags = store.list_tags().unwrap();
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].aliases, vec!["a".to_string()]);
+        let entries = store.list_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        // known tag id linked; unknown tag id skipped
+        assert_eq!(entries[0].tag_ids.len(), 1);
+        assert_eq!(entries[0].tag_ids[0], tag_id);
 
-        store.cache.invalidate();
-        let rebuilt = store.list_entries().unwrap();
-        assert_eq!(rebuilt[0].id, entry.id);
-        assert_eq!(rebuilt[0].tag_ids, cached[0].tag_ids);
-        assert_eq!(std::fs::read(store.tags_path()).unwrap(), canonical_tags);
-        assert_eq!(
-            std::fs::read(store.entries_path()).unwrap(),
-            canonical_entries
-        );
+        store.clear_all().unwrap();
+        assert!(store.is_empty().unwrap());
+        assert!(store.list_tags().unwrap().is_empty());
+        assert!(store.list_entries().unwrap().is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn cache_filters_single_and_multiple_tags_and_recovers_stale_or_corrupt_index() {
-        let dir =
-            std::env::temp_dir().join(format!("pantagraph_cache_filter_{}", uuid::Uuid::now_v7()));
-        let store = JsonlStore::new(&dir).unwrap();
-        let first = store.create_tag(Tag::new("first", "")).unwrap();
-        let second = store.create_tag(Tag::new("second", "")).unwrap();
-        let only_first = store
-            .create_entry(Entry::new(
-                "https://one.example",
-                None,
-                None,
-                "",
-                vec![first.id],
-            ))
-            .unwrap();
-        let both = store
-            .create_entry(Entry::new(
-                "https://both.example",
-                Some("archive".to_string()),
-                None,
-                "",
-                vec![first.id, second.id],
-            ))
-            .unwrap();
-
-        let first_matches = store.find_entries_by_tag(&first.id).unwrap();
-        assert_eq!(first_matches.len(), 2);
-        let all_matches = store.find_entries(&[first.id, second.id], None).unwrap();
-        assert_eq!(
-            all_matches.iter().map(|entry| entry.id).collect::<Vec<_>>(),
-            vec![both.id]
-        );
-        let archiver_matches = store.find_entries(&[], Some(Some("archive"))).unwrap();
-        assert_eq!(
-            archiver_matches
-                .iter()
-                .map(|entry| entry.id)
-                .collect::<Vec<_>>(),
-            vec![both.id]
-        );
-
-        // An external JSONL edit makes the cached source signature stale.
-        let mut entries = store.load_entries().unwrap();
-        let external = Entry::new("https://external.example", None, None, "", vec![second.id]);
-        let external_id = external.id;
-        entries.push(external);
-        save_jsonl(&store.entries_path(), &entries).unwrap();
-        let refreshed = store.find_entries_by_tag(&second.id).unwrap();
-        assert_eq!(
-            refreshed.iter().map(|entry| entry.id).collect::<Vec<_>>(),
-            vec![both.id, external_id]
-        );
-
-        // A damaged cache is disposable and rebuilt from JSONL.
-        store.cache.invalidate();
-        std::fs::write(dir.join("cache.sqlite3"), b"not a sqlite database").unwrap();
-        let recovered = store.find_entries_by_tag(&first.id).unwrap();
-        assert_eq!(recovered.len(), 2);
-        assert_eq!(recovered[0].id, only_first.id);
-
+    fn test_import_bulk_preserves_ordinal_order() {
+        let (store, dir) = temp_store("ordinal");
+        let entries: Vec<Entry> = (0..10)
+            .map(|i| {
+                Entry::new(
+                    format!("https://e/{i}"),
+                    None,
+                    None,
+                    format!("d{i}"),
+                    vec![],
+                )
+            })
+            .collect();
+        store.import_bulk(&[], &entries).unwrap();
+        let listed = store.list_entries().unwrap();
+        let urls: Vec<&str> = listed.iter().map(|e| e.url.as_str()).collect();
+        let expected: Vec<String> = (0..10).map(|i| format!("https://e/{i}")).collect();
+        let expected: Vec<&str> = expected.iter().map(|s| s.as_str()).collect();
+        assert_eq!(urls, expected);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
