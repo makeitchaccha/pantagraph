@@ -1,5 +1,6 @@
 mod application;
 mod config;
+mod tui;
 
 use pantagraph::{archiver, domain, query, store};
 
@@ -53,6 +54,8 @@ enum Commands {
         #[arg(long)]
         overwrite: bool,
     },
+    /// Browse search results interactively
+    Tui,
 }
 
 #[derive(Subcommand)]
@@ -267,6 +270,7 @@ fn run() -> Result<()> {
             );
             Ok(())
         }
+        Commands::Tui => tui::run(&store),
     }
 }
 

@@ -570,8 +570,32 @@ impl JsonlStore {
         query: &ResolvedQuery,
         archiver: Option<Option<&str>>,
     ) -> Result<Vec<Entry>> {
+        let mut entries = self.query_entries(query, None)?;
+        apply_archiver_filter(&mut entries, to_archiver_filter(archiver));
+        Ok(entries)
+    }
+
+    /// Find at most `limit` entries satisfying a boolean query, starting
+    /// at `offset`, ordered by insertion order.
+    ///
+    /// The limit is pushed into SQL so callers can page through the full
+    /// result set without loading it into memory. The archiver filter is
+    /// not applied here because it runs in memory after the SQL query.
+    pub fn find_entries_by_query_page(
+        &self,
+        query: &ResolvedQuery,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<Entry>> {
+        self.query_entries(query, Some((limit, offset)))
+    }
+
+    fn query_entries(
+        &self,
+        query: &ResolvedQuery,
+        page: Option<(usize, usize)>,
+    ) -> Result<Vec<Entry>> {
         let conn = self.conn()?;
-        let archiver_filter = to_archiver_filter(archiver);
 
         let mut tag_ids = HashSet::new();
         collect_tag_ids(query, &mut tag_ids);
@@ -592,13 +616,28 @@ impl JsonlStore {
         let mut params_vec = Vec::new();
         let mut counter = 0;
         let predicate = query_predicate(query, &internal_ids, &mut params_vec, &mut counter);
-        let sql = format!(
-            "SELECT e.id, e.url, e.archiver, e.archive_path, e.description, e.ordinal, e.internal_id
-             FROM entries e
-             WHERE {predicate}
-             ORDER BY e.ordinal"
-        );
+        let sql = match page {
+            Some(_) => format!(
+                "SELECT e.id, e.url, e.archiver, e.archive_path, e.description, e.ordinal, e.internal_id
+                 FROM entries e
+                 WHERE {predicate}
+                 ORDER BY e.ordinal
+                 LIMIT ?{} OFFSET ?{}",
+                params_vec.len() + 1,
+                params_vec.len() + 2
+            ),
+            None => format!(
+                "SELECT e.id, e.url, e.archiver, e.archive_path, e.description, e.ordinal, e.internal_id
+                 FROM entries e
+                 WHERE {predicate}
+                 ORDER BY e.ordinal"
+            ),
+        };
         let mut stmt = conn.prepare(&sql)?;
+        if let Some((limit, offset)) = page {
+            params_vec.push(rusqlite::types::Value::Integer(limit as i64));
+            params_vec.push(rusqlite::types::Value::Integer(offset as i64));
+        }
         let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| {
             self.load_entry_with_tags(&conn, row)
         })?;
@@ -606,7 +645,6 @@ impl JsonlStore {
         for r in rows {
             entries.push(r?);
         }
-        apply_archiver_filter(&mut entries, archiver_filter);
         Ok(entries)
     }
 
@@ -955,6 +993,59 @@ mod tests {
                 .map(|e| e.id)
                 .collect::<Vec<_>>(),
             vec![with_archiver]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_find_entries_by_query_page() {
+        let (store, dir) = temp_store("query_page");
+        let a = store.create_tag(Tag::new("a", "")).unwrap().id;
+        for i in 0..25 {
+            store
+                .create_entry(Entry::new(
+                    format!("https://e/{i}"),
+                    None,
+                    None,
+                    "",
+                    vec![a],
+                ))
+                .unwrap();
+        }
+
+        let page = |limit, offset| {
+            store
+                .find_entries_by_query_page(&Query::Tag(a), limit, offset)
+                .unwrap()
+                .iter()
+                .map(|e| e.url.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let page0 = page(10, 0);
+        assert_eq!(page0.len(), 10);
+        assert_eq!(page0.first().unwrap(), "https://e/0");
+        assert_eq!(page0.last().unwrap(), "https://e/9");
+
+        let page1 = page(10, 10);
+        assert_eq!(page1.len(), 10);
+        assert_eq!(page1.first().unwrap(), "https://e/10");
+
+        let page2 = page(10, 20);
+        assert_eq!(page2.len(), 5);
+        assert_eq!(page2.first().unwrap(), "https://e/20");
+
+        assert!(page(10, 25).is_empty());
+        assert_eq!(page(11, 0).len(), 11);
+
+        // The unpaged API still returns everything.
+        assert_eq!(
+            store
+                .find_entries_by_query(&Query::Tag(a), None)
+                .unwrap()
+                .len(),
+            25
         );
 
         let _ = std::fs::remove_dir_all(&dir);

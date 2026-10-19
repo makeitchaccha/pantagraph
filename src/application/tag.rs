@@ -46,6 +46,27 @@ impl fmt::Display for TagConflictAbort {
 
 impl std::error::Error for TagConflictAbort {}
 
+/// A tag reference matched more than one tag during resolution.
+///
+/// The rendered message is identical to the CLI's, so the TUI can either
+/// show it as-is or turn it into a selection list using [`TagAmbiguity::candidates`].
+#[derive(Debug)]
+pub struct TagAmbiguity {
+    /// The tag reference exactly as it appeared in the query.
+    pub input: String,
+    /// Matching tags, sorted by ID — the order `input#N` indexes into.
+    pub candidates: Vec<Tag>,
+    message: String,
+}
+
+impl fmt::Display for TagAmbiguity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for TagAmbiguity {}
+
 /// Parse a tag reference string.
 ///
 /// Supports `name#N`, `name@specifier#N`, `name@specifier`, and `name`.
@@ -123,7 +144,13 @@ pub fn resolve_tag(store: &JsonlStore, name_or_id: &str) -> Result<Tag> {
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            bail!("Multiple tags match '{name_or_id}':\n{candidates}\nAmbiguous tag name. Use {name_or_id}#N (or specify @specifier) to disambiguate.");
+            let message = format!("Multiple tags match '{name_or_id}':\n{candidates}\nAmbiguous tag name. Use {name_or_id}#N (or specify @specifier) to disambiguate.");
+            Err(TagAmbiguity {
+                input: name_or_id.to_string(),
+                candidates: tags,
+                message,
+            }
+            .into())
         }
     }
 }
@@ -344,5 +371,63 @@ mod tests {
             parse_tag_ref("rust@game#1"),
             ("rust", Some("game"), Some(1))
         );
+    }
+
+    #[test]
+    fn test_resolve_tag_ambiguity_is_structured() {
+        let dir = std::env::temp_dir().join(format!(
+            "pantagraph_test_ambiguity_{}",
+            uuid::Uuid::now_v7()
+        ));
+        let store = JsonlStore::new(&dir).unwrap();
+        store.create_tag(Tag::new("dup", "first")).unwrap();
+        store
+            .create_tag(Tag::with_specifier(
+                "dup",
+                Some("light".to_string()),
+                "second",
+                vec![],
+            ))
+            .unwrap();
+
+        let err = resolve_tag(&store, "dup").unwrap_err();
+        let amb = err
+            .downcast::<TagAmbiguity>()
+            .expect("ambiguity should be structured");
+        assert_eq!(amb.input, "dup");
+        assert_eq!(amb.candidates.len(), 2);
+
+        // The rendered message stays identical to the CLI's plain error,
+        // including the `#N` candidate refs.
+        let message = amb.to_string();
+        assert!(
+            message.starts_with("Multiple tags match 'dup':"),
+            "{message}"
+        );
+        assert!(message.contains("dup#1"));
+        assert!(message.contains("dup#2"));
+        assert!(message.contains("Use dup#N (or specify @specifier) to disambiguate."));
+
+        // The candidate order matches what `#N` resolves to.
+        let resolved = resolve_tag(&store, "dup#2").unwrap();
+        assert_eq!(resolved.id, amb.candidates[1].id);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_unambiguous_ref_is_not_ambiguity() {
+        let dir =
+            std::env::temp_dir().join(format!("pantagraph_test_unique_{}", uuid::Uuid::now_v7()));
+        let store = JsonlStore::new(&dir).unwrap();
+        store.create_tag(Tag::new("only", "")).unwrap();
+
+        let tag = resolve_tag(&store, "only").unwrap();
+        assert_eq!(tag.name, "only");
+
+        let err = resolve_tag(&store, "missing").unwrap_err();
+        assert!(err.downcast::<TagAmbiguity>().is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -9,6 +9,18 @@ use crate::store::JsonlStore;
 
 use super::tag::{resolve_query, resolve_tag};
 
+/// Number of entries fetched per search page.
+pub const SEARCH_PAGE_SIZE: usize = 10;
+
+/// One page of search results.
+#[derive(Debug)]
+pub struct EntryPage {
+    pub entries: Vec<Entry>,
+    pub names: HashMap<TagId, String>,
+    /// Whether more results exist after this page.
+    pub has_more: bool,
+}
+
 #[derive(Debug)]
 pub enum EntryResult {
     Added {
@@ -123,6 +135,33 @@ pub fn handle_entry_list(
 
     let names = tag_name_map(store)?;
     Ok(EntryResult::Listed { entries, names })
+}
+
+/// Execute `query` and fetch one zero-based page of results.
+///
+/// A blank query matches all entries, mirroring `entry list` without
+/// `--query`. One extra row is fetched to report whether a further page
+/// exists, then the page is truncated to [`SEARCH_PAGE_SIZE`].
+pub fn handle_entry_search_page(store: &JsonlStore, query: &str, page: usize) -> Result<EntryPage> {
+    let trimmed = query.trim();
+    let resolved = if trimmed.is_empty() {
+        Query::And(Vec::new())
+    } else {
+        let parsed = query::parse(trimmed)?;
+        resolve_query(store, &parsed)?
+    };
+
+    let offset = page * SEARCH_PAGE_SIZE;
+    let mut rows = store.find_entries_by_query_page(&resolved, SEARCH_PAGE_SIZE + 1, offset)?;
+    let has_more = rows.len() > SEARCH_PAGE_SIZE;
+    rows.truncate(SEARCH_PAGE_SIZE);
+
+    let names = tag_name_map(store)?;
+    Ok(EntryPage {
+        entries: rows,
+        names,
+        has_more,
+    })
 }
 
 pub fn handle_entry_show(store: &JsonlStore, id: String) -> Result<EntryResult> {
