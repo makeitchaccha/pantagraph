@@ -22,14 +22,20 @@ fn to_archiver_filter<'a>(archiver: Option<Option<&'a str>>) -> ArchiverFilter<'
     }
 }
 
-fn apply_archiver_filter(entries: &mut Vec<Entry>, filter: ArchiverFilter<'_>) {
+/// Render an [`ArchiverFilter`] as a SQL boolean expression over table alias `alias`.
+///
+/// `params` receives one parameter per placeholder in the returned clause.
+fn archiver_filter_predicate<'a>(
+    filter: ArchiverFilter<'a>,
+    alias: &str,
+    params: &mut Vec<rusqlite::types::Value>,
+) -> String {
     match filter {
-        ArchiverFilter::Any => {}
-        ArchiverFilter::WithoutArchiver => {
-            entries.retain(|e| e.archiver.is_none());
-        }
+        ArchiverFilter::Any => "1".to_string(),
+        ArchiverFilter::WithoutArchiver => format!("{alias}.archiver IS NULL"),
         ArchiverFilter::Named(name) => {
-            entries.retain(|e| e.archiver.as_deref() == Some(name));
+            params.push(rusqlite::types::Value::Text(name.to_string()));
+            format!("{alias}.archiver = ?{}", params.len())
         }
     }
 }
@@ -522,10 +528,8 @@ impl JsonlStore {
     /// Like [`find_entries`], but optionally pushes `limit`/`offset` into
     /// SQL when it is safe to do so.
     ///
-    /// The limit is pushed into SQL only when there is no in-memory
-    /// archiver filter (i.e. `archiver == None`), since that filter runs
-    /// after the SQL query and a SQL-level `LIMIT` could otherwise cut off
-    /// rows that the filter would have kept.
+    /// The archiver filter and the page are both pushed into SQL so this
+    /// function never applies an in-memory filter or slice.
     pub fn find_entries_page(
         &self,
         tag_ids: &[TagId],
@@ -534,93 +538,70 @@ impl JsonlStore {
     ) -> Result<Vec<Entry>> {
         let conn = self.conn()?;
         let archiver_filter = to_archiver_filter(archiver);
-        // Only push the page into SQL when no in-memory archiver filter
-        // will run after the query, otherwise a SQL LIMIT could drop rows
-        // the archiver filter would have kept.
-        let page = match archiver_filter {
-            ArchiverFilter::Any => page,
-            _ => None,
-        };
-        let tag_ids_str: Vec<String> = tag_ids.iter().map(|t| t.to_string()).collect();
-        let mut entries: Vec<Entry> = if tag_ids.is_empty() {
-            let sql = match page {
-                Some(_) => "SELECT id, url, archiver, archive_path, description, ordinal, internal_id FROM entries ORDER BY ordinal LIMIT ?1 OFFSET ?2",
-                None => "SELECT id, url, archiver, archive_path, description, ordinal, internal_id FROM entries ORDER BY ordinal",
-            };
-            let mut stmt = conn.prepare(sql)?;
-            let mut params_vec: Vec<rusqlite::types::Value> = Vec::new();
-            if let Some((limit, offset)) = page {
-                params_vec.push(rusqlite::types::Value::Integer(limit as i64));
-                params_vec.push(rusqlite::types::Value::Integer(offset as i64));
+
+        let mut internal_tag_ids = Vec::with_capacity(tag_ids.len());
+        for tag_id in tag_ids {
+            let internal_id = conn
+                .query_row(
+                    "SELECT internal_id FROM tags WHERE id = ?1",
+                    params![tag_id.to_string()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            if let Some(internal_id) = internal_id {
+                internal_tag_ids.push(internal_id);
+            } else {
+                // A referenced tag is missing entirely: this is an
+                // internal inconsistency (callers resolve names to ids
+                // first), so surface it as an error rather than silently
+                // matching nothing.
+                anyhow::bail!("Tag id {} not found in store", tag_id);
             }
-            let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| {
-                self.load_entry_with_tags(&conn, row)
-            })?;
-            let mut v = Vec::new();
-            for r in rows {
-                v.push(r?);
-            }
-            v
-        } else {
-            let mut internal_tag_ids = Vec::with_capacity(tag_ids_str.len());
-            for tag_id in tag_ids {
-                let internal_id = conn
-                    .query_row(
-                        "SELECT internal_id FROM tags WHERE id = ?1",
-                        params![tag_id.to_string()],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .optional()?;
-                if let Some(internal_id) = internal_id {
-                    internal_tag_ids.push(internal_id);
-                } else {
-                    internal_tag_ids.clear();
-                    break;
-                }
-            }
-            let exists_clause = (1..internal_tag_ids.len())
-                .map(|i| format!(
-                    " AND EXISTS (SELECT 1 FROM entry_tags matching_{i}
-                     WHERE matching_{i}.entry_id = e.internal_id
-                       AND matching_{i}.tag_id = ?{})",
-                    i + 1
-                ))
-                .collect::<String>();
-            let paging_clause = match page {
-                Some(_) => format!(
-                    " LIMIT ?{} OFFSET ?{}",
-                    internal_tag_ids.len() + 1,
-                    internal_tag_ids.len() + 2
-                ),
-                None => String::new(),
-            };
-            let sql = format!(
-                "SELECT e.id, e.url, e.archiver, e.archive_path, e.description, e.ordinal, e.internal_id
-                 FROM entries e
-                 JOIN entry_tags candidate ON candidate.entry_id = e.internal_id
-                 WHERE candidate.tag_id = ?1{exists_clause}
-                 ORDER BY e.ordinal{paging_clause}"
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let mut params_vec: Vec<rusqlite::types::Value> = Vec::new();
-            for internal_id in internal_tag_ids {
-                params_vec.push(rusqlite::types::Value::Integer(internal_id));
-            }
-            if let Some((limit, offset)) = page {
-                params_vec.push(rusqlite::types::Value::Integer(limit as i64));
-                params_vec.push(rusqlite::types::Value::Integer(offset as i64));
-            }
-            let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| {
-                self.load_entry_with_tags(&conn, row)
-            })?;
-            let mut v = Vec::new();
-            for r in rows {
-                v.push(r?);
-            }
-            v
+        }
+
+        let mut params_vec: Vec<rusqlite::types::Value> = Vec::new();
+        let mut predicates: Vec<String> = Vec::new();
+
+        for (i, internal_id) in internal_tag_ids.iter().enumerate() {
+            params_vec.push(rusqlite::types::Value::Integer(*internal_id));
+            predicates.push(format!(
+                "EXISTS (SELECT 1 FROM entry_tags matching_{i}
+                 WHERE matching_{i}.entry_id = e.internal_id
+                   AND matching_{i}.tag_id = ?{})",
+                params_vec.len()
+            ));
+        }
+
+        predicates.push(archiver_filter_predicate(archiver_filter, "e", &mut params_vec));
+        let where_clause = predicates.join(" AND ");
+
+        let paging_clause = match page {
+            Some(_) => format!(
+                " LIMIT ?{} OFFSET ?{}",
+                params_vec.len() + 1,
+                params_vec.len() + 2
+            ),
+            None => String::new(),
         };
 
-        apply_archiver_filter(&mut entries, archiver_filter);
+        let sql = format!(
+            "SELECT e.id, e.url, e.archiver, e.archive_path, e.description, e.ordinal, e.internal_id
+             FROM entries e
+             WHERE {where_clause}
+             ORDER BY e.ordinal{paging_clause}"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        if let Some((limit, offset)) = page {
+            params_vec.push(rusqlite::types::Value::Integer(limit as i64));
+            params_vec.push(rusqlite::types::Value::Integer(offset as i64));
+        }
+        let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| {
+            self.load_entry_with_tags(&conn, row)
+        })?;
+        let mut entries = Vec::new();
+        for r in rows {
+            entries.push(r?);
+        }
         Ok(entries)
     }
 
@@ -637,12 +618,10 @@ impl JsonlStore {
     }
 
     /// Like [`find_entries_by_query`], but optionally pushes `limit`/`offset`
-    /// into SQL when it is safe to do so.
+    /// into SQL.
     ///
-    /// The limit is pushed into SQL only when there is no in-memory
-    /// archiver filter (i.e. `archiver == None`), since that filter runs
-    /// after the SQL query and a SQL-level `LIMIT` could otherwise cut off
-    /// rows that the filter would have kept.
+    /// The archiver filter and the page are both pushed into SQL so this
+    /// function never applies an in-memory filter or slice.
     pub fn find_entries_by_query_page_opt(
         &self,
         query: &ResolvedQuery,
@@ -650,33 +629,27 @@ impl JsonlStore {
         page: Option<(usize, usize)>,
     ) -> Result<Vec<Entry>> {
         let archiver_filter = to_archiver_filter(archiver);
-        let page = match archiver_filter {
-            ArchiverFilter::Any => page,
-            _ => None,
-        };
-        let mut entries = self.query_entries(query, page)?;
-        apply_archiver_filter(&mut entries, archiver_filter);
-        Ok(entries)
+        self.query_entries(query, archiver_filter, page)
     }
 
     /// Find at most `limit` entries satisfying a boolean query, starting
     /// at `offset`, ordered by insertion order.
     ///
     /// The limit is pushed into SQL so callers can page through the full
-    /// result set without loading it into memory. The archiver filter is
-    /// not applied here because it runs in memory after the SQL query.
+    /// result set without loading it into memory.
     pub fn find_entries_by_query_page(
         &self,
         query: &ResolvedQuery,
         limit: usize,
         offset: usize,
     ) -> Result<Vec<Entry>> {
-        self.query_entries(query, Some((limit, offset)))
+        self.query_entries(query, ArchiverFilter::Any, Some((limit, offset)))
     }
 
     fn query_entries(
         &self,
         query: &ResolvedQuery,
+        archiver_filter: ArchiverFilter<'_>,
         page: Option<(usize, usize)>,
     ) -> Result<Vec<Entry>> {
         let conn = self.conn()?;
@@ -699,7 +672,9 @@ impl JsonlStore {
 
         let mut params_vec = Vec::new();
         let mut counter = 0;
-        let predicate = query_predicate(query, &internal_ids, &mut params_vec, &mut counter);
+        let mut predicate = query_predicate(query, &internal_ids, &mut params_vec, &mut counter);
+        let archiver_clause = archiver_filter_predicate(archiver_filter, "e", &mut params_vec);
+        predicate = format!("({predicate}) AND {archiver_clause}");
         let sql = match page {
             Some(_) => format!(
                 "SELECT e.id, e.url, e.archiver, e.archive_path, e.description, e.ordinal, e.internal_id

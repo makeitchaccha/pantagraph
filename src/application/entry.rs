@@ -132,12 +132,13 @@ pub fn handle_entry_list(
         }
     }
 
-    // Push `limit`/`offset` into SQL when it's safe: no in-memory archiver
-    // filter (which runs after the query and would make a SQL-level LIMIT
-    // incorrect) and `--after` resolved cleanly to an offset above. Only
-    // push when there is a `limit`; offset alone doesn't reduce rows
-    // fetched from SQL, so it isn't worth the SQL-level pushdown.
-    let sql_page = if archiver_filter.is_none() && (after.is_none() || after_resolved) {
+    // Push `limit`/`offset` into SQL when `--after` resolved cleanly to an
+    // offset above (or is not used at all). The archiver filter and tag /
+    // query filters are always pushed into SQL, so a SQL-level LIMIT is
+    // always correct here. Only push when there is a `limit`; offset alone
+    // doesn't reduce rows fetched from SQL, so it isn't worth the SQL-level
+    // pushdown.
+    let sql_page = if after.is_none() || after_resolved {
         limit.map(|limit| (limit, offset.unwrap_or(0) + after_offset))
     } else {
         None
