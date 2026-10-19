@@ -162,6 +162,11 @@ pub fn resolve_tag(store: &JsonlStore, name_or_id: &str) -> Result<Tag> {
 pub fn resolve_query(store: &JsonlStore, query: &Query) -> Result<ResolvedQuery> {
     let resolved = match query {
         Query::Tag(tag_ref) => Query::Tag(resolve_tag(store, tag_ref)?.id),
+        // Meta predicates are self-resolving; they carry no tag reference.
+        Query::Meta { key, value } => Query::Meta {
+            key: key.clone(),
+            value: value.clone(),
+        },
         Query::And(queries) => Query::And(
             queries
                 .iter()

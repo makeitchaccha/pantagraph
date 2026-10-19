@@ -2,8 +2,9 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+use serde::Deserialize;
 
-use crate::domain::{Entry, Tag};
+use crate::domain::{Entry, EntryId, Tag, TagId};
 use crate::store::JsonlStore;
 
 #[derive(Debug)]
@@ -46,6 +47,70 @@ fn load_jsonl<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
         values.push(value);
     }
     Ok(values)
+}
+
+/// Entry line as read from `entries.jsonl`, including the legacy
+/// top-level `archiver` / `archive_path` fields.
+///
+/// Old exports stored archiver data directly on the entry; those fields are
+/// folded into `meta` on import so their meaning survives the migration.
+#[derive(Deserialize)]
+struct EntryLine {
+    id: EntryId,
+    url: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    tag_ids: Vec<TagId>,
+    #[serde(default)]
+    meta: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    archiver: Option<String>,
+    #[serde(default)]
+    archive_path: Option<String>,
+}
+
+impl From<EntryLine> for Entry {
+    fn from(line: EntryLine) -> Self {
+        let mut meta = line.meta;
+        if let Some(archiver) = line.archiver {
+            meta.entry("archiver".to_string()).or_insert(archiver);
+        }
+        if let Some(path) = line.archive_path {
+            meta.entry("archive_path".to_string()).or_insert(path);
+        }
+        if meta.contains_key("archiver") {
+            meta.entry("archived".to_string()).or_insert_with(|| "true".to_string());
+        }
+        Entry {
+            id: line.id,
+            url: line.url,
+            description: line.description,
+            tag_ids: line.tag_ids,
+            meta,
+        }
+    }
+}
+
+fn load_entries_jsonl(path: &Path) -> Result<Vec<Entry>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let file =
+        std::fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut entries = Vec::new();
+    for (index, line) in reader.lines().enumerate() {
+        let line = line
+            .with_context(|| format!("Failed to read {} at line {}", path.display(), index + 1))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: EntryLine = serde_json::from_str(&line)
+            .with_context(|| format!("Failed to parse {} at line {}", path.display(), index + 1))?;
+        entries.push(value.into());
+    }
+    Ok(entries)
 }
 
 fn save_jsonl<T: serde::Serialize>(path: &Path, values: &[T]) -> Result<()> {
@@ -102,7 +167,7 @@ pub fn handle_import(
         );
     }
     let tags: Vec<Tag> = load_jsonl(&tags_file)?;
-    let entries: Vec<Entry> = load_jsonl(&entries_file)?;
+    let entries = load_entries_jsonl(&entries_file)?;
 
     if !store.is_empty()? && !overwrite {
         bail!(
@@ -141,14 +206,16 @@ mod tests {
         let rust_id = store.create_tag(rust.clone()).unwrap().id;
         let game_id = store.create_tag(game.clone()).unwrap().id;
 
-        let e1 = Entry::new(
+        let mut e1 = Entry::new(
             "https://example.com/a",
-            Some("yt-dlp".to_string()),
-            Some("archives/a.html".to_string()),
             "first",
             vec![rust_id],
         );
-        let e2 = Entry::new("https://example.com/b", None, None, "second", vec![game_id]);
+        e1.meta.insert("archived".to_string(), "true".to_string());
+        e1.meta.insert("archiver".to_string(), "yt-dlp".to_string());
+        e1.meta
+            .insert("archive_path".to_string(), "archives/a.html".to_string());
+        let e2 = Entry::new("https://example.com/b", "second", vec![game_id]);
         store.create_entry(e1.clone()).unwrap();
         store.create_entry(e2.clone()).unwrap();
 
@@ -177,10 +244,11 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].id, e1.id);
         assert_eq!(entries[0].url, "https://example.com/a");
-        assert_eq!(entries[0].archiver.as_deref(), Some("yt-dlp"));
+        assert_eq!(entries[0].meta.get("archiver").map(String::as_str), Some("yt-dlp"));
+        assert_eq!(entries[0].meta.get("archived").map(String::as_str), Some("true"));
         assert_eq!(entries[0].tag_ids, vec![rust_id]);
         assert_eq!(entries[1].id, e2.id);
-        assert!(entries[1].archiver.is_none());
+        assert!(entries[1].meta.is_empty());
 
         let _ = std::fs::remove_dir_all(&store_dir);
         let _ = std::fs::remove_dir_all(&store2_dir);
@@ -197,7 +265,7 @@ mod tests {
         let tag = Tag::new("t", "d");
         let tid = store.create_tag(tag).unwrap().id;
         store
-            .create_entry(Entry::new("https://x.test", None, None, "", vec![tid]))
+            .create_entry(Entry::new("https://x.test", "", vec![tid]))
             .unwrap();
         handle_export(&store, Some(src_dir.to_string_lossy().into())).unwrap();
 
@@ -245,7 +313,7 @@ mod tests {
         std::fs::create_dir_all(&src_dir).unwrap();
         // entries.jsonl without tags.jsonl; unknown tag ids are skipped
         let unknown = TagId::new();
-        let entry = Entry::new("https://only.entries", None, None, "desc", vec![unknown]);
+        let entry = Entry::new("https://only.entries", "desc", vec![unknown]);
         save_jsonl(&entries_path(&src_dir), std::slice::from_ref(&entry)).unwrap();
 
         let store = JsonlStore::new(&store_dir).unwrap();
@@ -270,8 +338,6 @@ mod tests {
                 store
                     .create_entry(Entry::new(
                         format!("https://example.com/{i}"),
-                        None,
-                        None,
                         format!("e{i}"),
                         vec![],
                     ))

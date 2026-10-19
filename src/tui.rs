@@ -553,8 +553,6 @@ mod tests {
             store
                 .create_entry(Entry::new(
                     format!("https://example.test/{i}"),
-                    None,
-                    None,
                     format!("entry {i}"),
                     vec![tag_id],
                 ))
@@ -809,8 +807,6 @@ mod tests {
             store
                 .create_entry(Entry::new(
                     format!("https://example.test/{url}"),
-                    None,
-                    None,
                     format!("entry {url}"),
                     vec![id],
                 ))
@@ -856,8 +852,6 @@ mod tests {
         store
             .create_entry(Entry::new(
                 "https://example.test/x".to_string(),
-                None,
-                None,
                 "entry x".to_string(),
                 vec![second],
             ))

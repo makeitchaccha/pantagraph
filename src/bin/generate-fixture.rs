@@ -99,7 +99,7 @@ fn generate_fixture(
     let mut archived_entries = 0;
     let mut total_tag_assignments = 0;
     for entry in generate_entries(&mut rng, entry_count, &tags, min_tags, max_tags, words) {
-        if entry.archiver.is_some() {
+        if entry.meta.contains_key("archiver") {
             archived_entries += 1;
         }
         total_tag_assignments += entry.tag_ids.len();
@@ -236,19 +236,22 @@ fn generate_entries<'a>(
 
         let archiver = ARCHIVERS[rng.random_range(0..ARCHIVERS.len())].map(str::to_string);
 
-        let archive_path = archiver
-            .as_ref()
-            .map(|name| format!("archives/{name}/{id}.html"));
+        let mut meta = std::collections::BTreeMap::new();
+        if let Some(name) = archiver {
+            let archive_path = format!("archives/{name}/{id}.html");
+            meta.insert("archived".to_string(), "true".to_string());
+            meta.insert("archiver".to_string(), name);
+            meta.insert("archive_path".to_string(), archive_path);
+        }
 
         let tag_ids = generate_tag_ids(rng, tags, min_tags, max_tags);
 
         Entry {
             id,
             url,
-            archiver,
-            archive_path,
             description: format!("A {first} {second} resource"),
             tag_ids,
+            meta,
         }
     })
 }

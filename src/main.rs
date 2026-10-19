@@ -193,6 +193,36 @@ enum EntryCommands {
         /// Tag name or ID to add
         tag: String,
     },
+    /// Manage an entry's meta attributes (system-assigned key/value data)
+    Meta {
+        #[command(subcommand)]
+        command: EntryMetaCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum EntryMetaCommands {
+    /// Set a meta key on an entry
+    Set {
+        /// Entry ID
+        entry_id: String,
+        /// Meta key (free-form, e.g. `source`)
+        key: String,
+        /// Meta value
+        value: String,
+    },
+    /// Remove a meta key from an entry
+    Remove {
+        /// Entry ID
+        entry_id: String,
+        /// Meta key to remove
+        key: String,
+    },
+    /// List an entry's meta attributes
+    List {
+        /// Entry ID
+        entry_id: String,
+    },
 }
 
 // ── Main ────────────────────────────────────────────────────────────
@@ -270,6 +300,21 @@ fn run() -> Result<()> {
             EntryCommands::Tag { entry_id, tag } => {
                 entry::handle_entry_tag(&store, entry_id, tag).map(present_entry_result)
             }
+            EntryCommands::Meta { command } => match command {
+                EntryMetaCommands::Set {
+                    entry_id,
+                    key,
+                    value,
+                } => entry::handle_entry_meta_set(&store, entry_id, key, value)
+                    .map(present_entry_result),
+                EntryMetaCommands::Remove { entry_id, key } => {
+                    entry::handle_entry_meta_remove(&store, entry_id, key)
+                        .map(present_entry_result)
+                }
+                EntryMetaCommands::List { entry_id } => {
+                    entry::handle_entry_meta_list(&store, entry_id).map(present_entry_result)
+                }
+            },
         },
         Commands::Export { out } => {
             let result = importexport::handle_export(&store, out)?;
@@ -340,9 +385,8 @@ fn present_tag_result(result: tag::TagResult) {
                     println!(
                         "  {}{}",
                         entry
-                            .archiver
-                            .as_ref()
-                            .filter(|a| !a.is_empty())
+                            .meta
+                            .get("archiver")
                             .map(|a| format!("[{a}] "))
                             .unwrap_or_default(),
                         entry.url
@@ -401,11 +445,8 @@ fn present_entry_result(result: entry::EntryResult) {
         Show { entry, names } => {
             println!("URL:         {}", entry.url);
             println!("ID:          {}", entry.id);
-            if let Some(archiver) = &entry.archiver {
-                println!("Archiver:    {archiver}");
-            }
-            if let Some(path) = &entry.archive_path {
-                println!("Archive:     {path}");
+            for (key, value) in &entry.meta {
+                println!("Meta:        {key}={value}");
             }
             println!(
                 "Description: {}",
@@ -435,6 +476,32 @@ fn present_entry_result(result: entry::EntryResult) {
             );
         }
         Tagged { entry_id, tag_name } => println!("Added tag '{}' to entry {}", tag_name, entry_id),
+        MetaSet {
+            entry_id,
+            key,
+            value,
+        } => println!("Set {key}={value} on entry {entry_id}"),
+        MetaRemoved {
+            entry_id,
+            key,
+            removed,
+        } => {
+            if removed {
+                println!("Removed {key} from entry {entry_id}");
+            } else {
+                println!("Entry {entry_id} has no {key} meta key");
+            }
+        }
+        MetaListed { entry_id, meta } => {
+            if meta.is_empty() {
+                println!("Entry {entry_id} has no meta attributes.");
+            } else {
+                println!("Meta attributes for entry {entry_id}:");
+                for (key, value) in meta {
+                    println!("  {key}={value}");
+                }
+            }
+        }
     }
 }
 
@@ -486,13 +553,12 @@ fn print_entry_short(entry: &Entry, names: &HashMap<TagId, String>) {
         tags.join(", ")
     };
     let badge = entry
-        .archiver
-        .as_ref()
-        .filter(|a| !a.is_empty())
+        .meta
+        .get("archiver")
         .map(|a| format!("[{a}] "))
         .unwrap_or_default();
     println!("{badge}{}  [{tags}]", entry.url);
-    if let Some(path) = &entry.archive_path {
+    if let Some(path) = entry.meta.get("archive_path") {
         println!("  archive: {path}");
     }
     if !entry.description.is_empty() {
@@ -897,7 +963,7 @@ mod tests {
 
         let ids = |tag_ids: Vec<TagId>| {
             store
-                .create_entry(Entry::new("https://x.test", None, None, "", tag_ids))
+                .create_entry(Entry::new("https://x.test", "", tag_ids))
                 .unwrap()
                 .id
         };
@@ -976,7 +1042,7 @@ mod tests {
 
         let ids = |tag_ids: Vec<TagId>| {
             store
-                .create_entry(Entry::new("https://x.test", None, None, "", tag_ids))
+                .create_entry(Entry::new("https://x.test", "", tag_ids))
                 .unwrap()
                 .id
         };

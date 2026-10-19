@@ -150,6 +150,8 @@ pantagraph tag alias list <NAME_OR_ALIAS_OR_ID>
 
 #### エントリの追加（URLブックマークのみ）
 `--archiver` を指定しない（または `""`）場合、外部ツールを実行せずURLのみを記録します:
+
+アーカイバ実行時には、アーカイブメタデータ（`archived`、`archiver`、`archive_path`）が `entries.jsonl` の `meta` フィールドに記録されます。
 ```bash
 pantagraph entry add <URL> --tag <TAG> [-d <DESC>]
 # 例:
@@ -202,3 +204,58 @@ data/
 └── archives/
     └── <entry_id>/  # 外部アーカイバによって保存されたファイル群
 ```
+
+## クエリ構文
+
+`--query` オプションでは、タグ参照の論理式でエントリを絞り込めます。演算子は以下が利用できます：
+
+- 空白または `*` : AND（積集合）
+- `+` : OR（和集合）
+- `!` : NOT（補集合）
+- `(` `)` : グループ化
+
+さらに、`meta:<キー>[=<値>]` でメタ属性による絞り込みが可能です（値を省略した場合はキーの存在のみチェックします）。
+
+例：
+```bash
+# rust と game の両方にマッチ
+pantagraph entry list --query "rust game"
+pantagraph entry list --query "rust * game"
+
+# rust または game
+pantagraph entry list --query "rust + game"
+
+# rust を含み、game は含まない
+pantagraph entry list --query "rust * !game"
+
+# yt-dlp でアーカイブされたもの
+pantagraph entry list --query "meta:archiver=yt-dlp"
+
+# いずれかのアーカイバでアーカイブされたもの
+pantagraph entry list --query "meta:archiver"
+
+# アーカイブされていないもの
+pantagraph entry list --query "!meta:archiver"
+
+# 複合条件
+pantagraph entry list --query "(rust + cpp) * meta:archived=true"
+```
+
+### メタ属性
+
+エントリのメタ属性は `entries.jsonl` の `meta` フィールド（文字列のキー・バリューマップ）に格納されます。アーカイバ関連情報は `meta` に記録されます：
+
+- `archived`（文字列）: 外部アーカイバが正常に実行された場合は `"true"`
+- `archiver`（文字列）: 使用したアーカイバ名
+- `archive_path`（文字列）: アーカイバが記録したパスまたは識別子（通常 `<data_dir>/archives/<entry_id>/`）
+
+例：
+```json
+{"id":"...","url":"...","description":"...","tag_ids":["..."],"meta":{"archived":"true","archiver":"single-file","archive_path":"archives/<entry_id>/"}}
+```
+
+任意のメタキーは以下のコマンドで管理できます：
+
+- `pantagraph entry meta set <ENTRY_ID> <KEY> <VALUE>`
+- `pantagraph entry meta remove <ENTRY_ID> <KEY>`
+- `pantagraph entry meta list <ENTRY_ID>`

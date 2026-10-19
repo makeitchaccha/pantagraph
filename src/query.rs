@@ -8,7 +8,8 @@
 //! or     := and ("+" and)*
 //! and    := unary (("*" unary) | unary)*
 //! unary  := "!" unary | primary
-//! primary := TAG | "(" expr ")"
+//! primary := TAG | META | "(" expr ")"
+//! META    := "meta:" key ["=" value]
 //! ```
 //!
 //! Semantics are set operations over entries: `A * B` is intersection,
@@ -16,8 +17,14 @@
 //! Whitespace between adjacent terms is an implicit AND, so `A B` and
 //! `A * B` are equivalent.
 //!
+//! `meta:` is a reserved prefix: `meta:key=value` matches entries whose
+//! `key` meta attribute equals `value` exactly, and `meta:key` matches
+//! entries that have the `key` attribute at any value. A key with no
+//! matching entries matches nothing, so `!meta:key` matches everything.
+//!
 //! Parsing only builds the [`Query`] AST; tag references stay verbatim
-//! strings and are resolved to [`TagId`]s in a separate step.
+//! strings and are resolved to [`TagId`]s in a separate step. Meta
+//! predicates need no resolution and pass through unchanged.
 
 use std::fmt;
 
@@ -33,6 +40,16 @@ use crate::domain::TagId;
 pub enum Query<T = String> {
     /// A single tag reference.
     Tag(T),
+    /// An entry meta attribute predicate: `meta:key` matches entries
+    /// holding `key` at any value; `meta:key=value` matches entries whose
+    /// `key` equals `value` exactly. `T` is unused — meta keys resolve to
+    /// themselves.
+    Meta {
+        /// Meta attribute key (free-form, case-sensitive).
+        key: String,
+        /// Expected value, or `None` to test presence only.
+        value: Option<String>,
+    },
     /// All operands match (intersection).
     And(Vec<Query<T>>),
     /// At least one operand matches (union).
@@ -104,6 +121,35 @@ struct Token {
 
 fn is_reserved(c: char) -> bool {
     matches!(c, '+' | '*' | '!' | '(' | ')')
+}
+
+/// Reserved query prefix introducing a meta attribute predicate.
+///
+/// `:` stays unreserved for the tokenizer so `meta:key=value` lexes as a
+/// single [`TokenKind::Tag`]; the prefix is only interpreted in
+/// [`Parser::parse_primary`].
+const META_PREFIX: &str = "meta:";
+
+/// Parse the body of a `meta:` term (everything after the prefix).
+///
+/// `key` matches any value, `key=value` matches that exact value. An
+/// empty key is rejected; an empty value (`key=`) is an exact match
+/// against the empty string.
+fn parse_meta(rest: &str, token_position: usize) -> Result<Query, QueryParseError> {
+    let (key, value) = match rest.split_once('=') {
+        Some((key, value)) => (key, Some(value.to_string())),
+        None => (rest, None),
+    };
+    if key.is_empty() {
+        return Err(QueryParseError::new(
+            token_position,
+            "empty meta key after `meta:`",
+        ));
+    }
+    Ok(Query::Meta {
+        key: key.to_string(),
+        value,
+    })
 }
 
 fn tokenize(input: &str) -> Vec<Token> {
@@ -208,7 +254,10 @@ impl Parser {
             None => return Err(self.eof()),
         };
         match token.kind {
-            TokenKind::Tag(tag) => Ok(Query::Tag(tag)),
+            TokenKind::Tag(tag) => match tag.strip_prefix(META_PREFIX) {
+                Some(rest) => parse_meta(rest, token.position),
+                None => Ok(Query::Tag(tag)),
+            },
             TokenKind::LParen => {
                 let inner = self.parse_expr()?;
                 match self.tokens.next() {
@@ -422,6 +471,57 @@ mod tests {
         assert_eq!(
             parse("(A) B)"),
             Err(QueryParseError::new(5, "unexpected token `)`"))
+        );
+    }
+
+    #[test]
+    fn test_parse_meta_key_only() {
+        assert_eq!(
+            parse("meta:archiver").unwrap(),
+            Query::Meta {
+                key: "archiver".to_string(),
+                value: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_meta_key_value() {
+        assert_eq!(
+            parse("meta:archiver=yt-dlp").unwrap(),
+            Query::Meta {
+                key: "archiver".to_string(),
+                value: Some("yt-dlp".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_meta_with_and_not() {
+        assert_eq!(
+            parse("A * meta:archived=true").unwrap(),
+            Query::And(vec![
+                Query::Tag("A".to_string()),
+                Query::Meta {
+                    key: "archived".to_string(),
+                    value: Some("true".to_string()),
+                },
+            ])
+        );
+        assert_eq!(
+            parse("!meta:archived").unwrap(),
+            Query::Not(Box::new(Query::Meta {
+                key: "archived".to_string(),
+                value: None,
+            }))
+        );
+    }
+
+    #[test]
+    fn test_parse_meta_empty_key_error() {
+        assert_eq!(
+            parse("meta:").unwrap_err(),
+            QueryParseError::new(0, "empty meta key after `meta:`")
         );
     }
 

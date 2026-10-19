@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt;
 use uuid::Uuid;
 
@@ -124,34 +125,29 @@ impl Tag {
 }
 
 /// An entry representing indexed content (bookmark URL or archived content).
+///
+/// `meta` holds system-assigned attributes (e.g. `archiver`, `source`) as
+/// plain key/value data: keys are not a Rust enum, so unknown keys are
+/// preserved as-is.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entry {
     pub id: EntryId,
     pub url: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub archiver: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub archive_path: Option<String>,
     #[serde(default)]
     pub description: String,
     pub tag_ids: Vec<TagId>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub meta: BTreeMap<String, String>,
 }
 
 impl Entry {
-    pub fn new(
-        url: impl Into<String>,
-        archiver: Option<String>,
-        archive_path: Option<String>,
-        description: impl Into<String>,
-        tag_ids: Vec<TagId>,
-    ) -> Self {
+    pub fn new(url: impl Into<String>, description: impl Into<String>, tag_ids: Vec<TagId>) -> Self {
         Self {
             id: EntryId::new(),
             url: url.into(),
-            archiver,
-            archive_path,
             description: description.into(),
             tag_ids,
+            meta: BTreeMap::new(),
         }
     }
 }

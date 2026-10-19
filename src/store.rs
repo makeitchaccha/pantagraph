@@ -22,21 +22,55 @@ fn to_archiver_filter<'a>(archiver: Option<Option<&'a str>>) -> ArchiverFilter<'
     }
 }
 
-/// Render an [`ArchiverFilter`] as a SQL boolean expression over table alias `alias`.
+/// Render a meta attribute condition as a SQL boolean expression over
+/// table alias `alias` (e.g. `e`).
+///
+/// `value = None` checks that the key is present with any value;
+/// `Some(v)` matches the exact value. Each call appends its own
+/// correlated subquery alias via `counter`, so the clause can be reused
+/// multiple times in one statement.
+fn meta_predicate(
+    alias: &str,
+    key: &str,
+    value: Option<&str>,
+    params: &mut Vec<rusqlite::types::Value>,
+    counter: &mut usize,
+) -> String {
+    *counter += 1;
+    let n = *counter;
+    params.push(rusqlite::types::Value::Text(key.to_string()));
+    let key_param = params.len();
+    let value_clause = match value {
+        Some(v) => {
+            params.push(rusqlite::types::Value::Text(v.to_string()));
+            format!(" AND em{n}.value = ?{}", params.len())
+        }
+        None => String::new(),
+    };
+    format!(
+        "EXISTS (SELECT 1 FROM entry_meta em{n}
+         JOIN meta_keys mk{n} ON mk{n}.internal_id = em{n}.key_id
+         WHERE em{n}.entry_id = {alias}.internal_id
+           AND mk{n}.key = ?{key_param}{value_clause})"
+    )
+}
+
+/// Render an [`ArchiverFilter`] as a SQL boolean expression over table
+/// alias `alias`, expressed through the `archiver` meta key.
 ///
 /// `params` receives one parameter per placeholder in the returned clause.
-fn archiver_filter_predicate<'a>(
-    filter: ArchiverFilter<'a>,
+fn archiver_filter_predicate(
+    filter: ArchiverFilter<'_>,
     alias: &str,
     params: &mut Vec<rusqlite::types::Value>,
+    counter: &mut usize,
 ) -> String {
     match filter {
         ArchiverFilter::Any => "1".to_string(),
-        ArchiverFilter::WithoutArchiver => format!("{alias}.archiver IS NULL"),
-        ArchiverFilter::Named(name) => {
-            params.push(rusqlite::types::Value::Text(name.to_string()));
-            format!("{alias}.archiver = ?{}", params.len())
+        ArchiverFilter::WithoutArchiver => {
+            format!("NOT {}", meta_predicate(alias, "archiver", None, params, counter))
         }
+        ArchiverFilter::Named(name) => meta_predicate(alias, "archiver", Some(name), params, counter),
     }
 }
 
@@ -54,6 +88,7 @@ fn collect_tag_ids(query: &ResolvedQuery, out: &mut HashSet<TagId>) {
         Query::Tag(tag_id) => {
             out.insert(*tag_id);
         }
+        Query::Meta { .. } => {}
         Query::And(queries) | Query::Or(queries) => {
             for q in queries {
                 collect_tag_ids(q, out);
@@ -65,9 +100,10 @@ fn collect_tag_ids(query: &ResolvedQuery, out: &mut HashSet<TagId>) {
 
 /// Translate query set semantics into a SQL boolean expression over `e`.
 ///
-/// `params` receives one internal tag id per positive tag reference, in
-/// the order their `?N` placeholders appear. Tag ids missing from
-/// `internal_ids` match nothing, so `NOT` over them matches everything.
+/// `params` receives one parameter per `?N` placeholder in the order the
+/// placeholders appear (tag ids for positive tag references, key/value
+/// text for meta predicates). Tag ids missing from `internal_ids` match
+/// nothing, so `NOT` over them matches everything.
 fn query_predicate(
     query: &ResolvedQuery,
     internal_ids: &HashMap<TagId, i64>,
@@ -89,6 +125,11 @@ fn query_predicate(
             }
             None => "0".to_string(),
         },
+        // `meta:key` / `meta:key=value` → EXISTS over entry_meta. A key
+        // with no rows matches nothing, so `!meta:key` matches everything.
+        Query::Meta { key, value } => {
+            meta_predicate("e", key, value.as_deref(), params, counter)
+        }
         Query::And(queries) if queries.is_empty() => "1".to_string(),
         Query::Or(queries) if queries.is_empty() => "0".to_string(),
         Query::And(queries) => format!(
@@ -420,24 +461,29 @@ impl JsonlStore {
             |row| row.get(0),
         )?;
         tx.execute(
-            "INSERT INTO entries (id, url, archiver, archive_path, description, ordinal) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                entry.id.to_string(),
-                entry.url,
-                entry.archiver,
-                entry.archive_path,
-                entry.description,
-                ordinal
-            ],
+            "INSERT INTO entries (id, url, description, ordinal) VALUES (?1, ?2, ?3, ?4)",
+            params![entry.id.to_string(), entry.url, entry.description, ordinal],
         )?;
+        let internal_id: i64 = tx.last_insert_rowid();
         for tid in &entry.tag_ids {
             tx.execute(
                 "INSERT OR IGNORE INTO entry_tags (entry_id, tag_id)
-                 SELECT e.internal_id, t.internal_id FROM entries e, tags t
-                 WHERE e.id = ?1 AND t.id = ?2",
-                params![entry.id.to_string(), tid.to_string()],
+                 VALUES (?1, (SELECT internal_id FROM tags WHERE id = ?2))",
+                params![internal_id, tid.to_string()],
             )?;
         }
+        let mut meta_key_stmt =
+            tx.prepare("INSERT OR IGNORE INTO meta_keys (key) VALUES (?1)")?;
+        let mut meta_value_stmt = tx.prepare(
+            "INSERT OR REPLACE INTO entry_meta (entry_id, key_id, value)
+             VALUES (?1, (SELECT internal_id FROM meta_keys WHERE key = ?2), ?3)",
+        )?;
+        for (key, value) in &entry.meta {
+            meta_key_stmt.execute(params![key])?;
+            meta_value_stmt.execute(params![internal_id, key, value])?;
+        }
+        drop(meta_key_stmt);
+        drop(meta_value_stmt);
         tx.commit()?;
         Ok(entry)
     }
@@ -448,17 +494,15 @@ impl JsonlStore {
     ) -> rusqlite::Result<Entry> {
         let id_str: String = entry_row.get(0)?;
         let url: String = entry_row.get(1)?;
-        let archiver: Option<String> = entry_row.get(2)?;
-        let archive_path: Option<String> = entry_row.get(3)?;
-        let description: String = entry_row.get(4)?;
-        let _ordinal: i64 = entry_row.get(5)?;
+        let description: String = entry_row.get(2)?;
+        let _ordinal: i64 = entry_row.get(3)?;
         let id = parse_uuid_id::<EntryId>(&id_str)?;
+        let internal_id: i64 = entry_row.get(4)?;
         let mut stmt = conn.prepare(
             "SELECT t.id FROM entry_tags et JOIN tags t ON t.internal_id = et.tag_id
              WHERE et.entry_id = ?1",
         )?;
         let mut tag_ids = Vec::new();
-        let internal_id: i64 = entry_row.get(6)?;
         let rows = stmt.query_map(params![internal_id], |r| {
             let t: String = r.get(0)?;
             Ok(t)
@@ -469,13 +513,28 @@ impl JsonlStore {
                 tag_ids.push(tid);
             }
         }
+        let mut meta_stmt = conn.prepare(
+            "SELECT mk.key, em.value FROM entry_meta em
+             JOIN meta_keys mk ON mk.internal_id = em.key_id
+             WHERE em.entry_id = ?1
+             ORDER BY mk.key",
+        )?;
+        let mut meta = std::collections::BTreeMap::new();
+        let meta_rows = meta_stmt.query_map(params![internal_id], |r| {
+            let key: String = r.get(0)?;
+            let value: String = r.get(1)?;
+            Ok((key, value))
+        })?;
+        for r in meta_rows {
+            let (key, value) = r?;
+            meta.insert(key, value);
+        }
         Ok(Entry {
             id,
             url,
-            archiver,
-            archive_path,
             description,
             tag_ids,
+            meta,
         })
     }
     pub fn list_entries(&self) -> Result<Vec<Entry>> {
@@ -485,7 +544,7 @@ impl JsonlStore {
     pub fn find_entry_by_id(&self, id: &EntryId) -> Result<Option<Entry>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, url, archiver, archive_path, description, ordinal, internal_id FROM entries WHERE id = ?1",
+            "SELECT id, url, description, ordinal, internal_id FROM entries WHERE id = ?1",
         )?;
         let entry = stmt
             .query_row(params![id.to_string()], |row| {
@@ -560,6 +619,7 @@ impl JsonlStore {
         }
 
         let mut params_vec: Vec<rusqlite::types::Value> = Vec::new();
+        let mut counter = 0;
         let mut predicates: Vec<String> = Vec::new();
 
         for (i, internal_id) in internal_tag_ids.iter().enumerate() {
@@ -572,7 +632,12 @@ impl JsonlStore {
             ));
         }
 
-        predicates.push(archiver_filter_predicate(archiver_filter, "e", &mut params_vec));
+        predicates.push(archiver_filter_predicate(
+            archiver_filter,
+            "e",
+            &mut params_vec,
+            &mut counter,
+        ));
         let where_clause = predicates.join(" AND ");
 
         let paging_clause = match page {
@@ -585,7 +650,7 @@ impl JsonlStore {
         };
 
         let sql = format!(
-            "SELECT e.id, e.url, e.archiver, e.archive_path, e.description, e.ordinal, e.internal_id
+            "SELECT e.id, e.url, e.description, e.ordinal, e.internal_id
              FROM entries e
              WHERE {where_clause}
              ORDER BY e.ordinal{paging_clause}"
@@ -673,11 +738,12 @@ impl JsonlStore {
         let mut params_vec = Vec::new();
         let mut counter = 0;
         let mut predicate = query_predicate(query, &internal_ids, &mut params_vec, &mut counter);
-        let archiver_clause = archiver_filter_predicate(archiver_filter, "e", &mut params_vec);
+        let archiver_clause =
+            archiver_filter_predicate(archiver_filter, "e", &mut params_vec, &mut counter);
         predicate = format!("({predicate}) AND {archiver_clause}");
         let sql = match page {
             Some(_) => format!(
-                "SELECT e.id, e.url, e.archiver, e.archive_path, e.description, e.ordinal, e.internal_id
+                "SELECT e.id, e.url, e.description, e.ordinal, e.internal_id
                  FROM entries e
                  WHERE {predicate}
                  ORDER BY e.ordinal
@@ -686,7 +752,7 @@ impl JsonlStore {
                 params_vec.len() + 2
             ),
             None => format!(
-                "SELECT e.id, e.url, e.archiver, e.archive_path, e.description, e.ordinal, e.internal_id
+                "SELECT e.id, e.url, e.description, e.ordinal, e.internal_id
                  FROM entries e
                  WHERE {predicate}
                  ORDER BY e.ordinal"
@@ -726,10 +792,12 @@ impl JsonlStore {
         Ok(tag_count == 0 && entry_count == 0)
     }
 
-    /// Delete all tags, entries, and their links.
+    /// Delete all tags, entries, meta attributes, and their links.
     pub fn clear_all(&self) -> Result<()> {
         let conn = self.conn()?;
         let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM entry_meta", [])?;
+        tx.execute("DELETE FROM meta_keys", [])?;
         tx.execute("DELETE FROM entry_tags", [])?;
         tx.execute("DELETE FROM entries", [])?;
         tx.execute("DELETE FROM tags", [])?;
@@ -764,19 +832,24 @@ impl JsonlStore {
         }
         {
             let mut entry_stmt = tx.prepare(
-                "INSERT INTO entries (id, url, archiver, archive_path, description, ordinal) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO entries (id, url, description, ordinal) VALUES (?1, ?2, ?3, ?4)",
             )?;
             let mut link_stmt = tx.prepare(
                 "INSERT OR IGNORE INTO entry_tags (entry_id, tag_id)
                  SELECT e.internal_id, t.internal_id FROM entries e, tags t
                  WHERE e.id = ?1 AND t.id = ?2",
             )?;
+            let mut meta_key_stmt =
+                tx.prepare("INSERT OR IGNORE INTO meta_keys (key) VALUES (?1)")?;
+            let mut meta_value_stmt = tx.prepare(
+                "INSERT OR REPLACE INTO entry_meta (entry_id, key_id, value)
+                 VALUES ((SELECT internal_id FROM entries WHERE id = ?1),
+                         (SELECT internal_id FROM meta_keys WHERE key = ?2), ?3)",
+            )?;
             for (ordinal, entry) in entries.iter().enumerate() {
                 entry_stmt.execute(params![
                     entry.id.to_string(),
                     entry.url,
-                    entry.archiver,
-                    entry.archive_path,
                     entry.description,
                     ordinal as i64
                 ])?;
@@ -784,10 +857,86 @@ impl JsonlStore {
                     let tag_id_str = tag_id.to_string();
                     link_stmt.execute(params![entry.id.to_string(), tag_id_str])?;
                 }
+                for (key, value) in &entry.meta {
+                    meta_key_stmt.execute(params![key])?;
+                    meta_value_stmt.execute(params![entry.id.to_string(), key, value])?;
+                }
             }
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Set (or overwrite) `key` on an entry's meta attributes.
+    pub fn set_entry_meta(&self, entry_id: &EntryId, key: &str, value: &str) -> Result<()> {
+        let conn = self.conn()?;
+        let tx = conn.unchecked_transaction()?;
+        let internal_id: Option<i64> = tx
+            .query_row(
+                "SELECT internal_id FROM entries WHERE id = ?1",
+                params![entry_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(internal_id) = internal_id else {
+            anyhow::bail!("Entry not found: {entry_id}");
+        };
+        tx.execute("INSERT OR IGNORE INTO meta_keys (key) VALUES (?1)", params![key])?;
+        tx.execute(
+            "INSERT OR REPLACE INTO entry_meta (entry_id, key_id, value)
+             VALUES (?1, (SELECT internal_id FROM meta_keys WHERE key = ?2), ?3)",
+            params![internal_id, key, value],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Remove `key` from an entry's meta attributes.
+    ///
+    /// Removing a key that is not set is not an error. Returns whether the
+    /// key was present.
+    pub fn remove_entry_meta(&self, entry_id: &EntryId, key: &str) -> Result<bool> {
+        let conn = self.conn()?;
+        let removed = conn.execute(
+            "DELETE FROM entry_meta
+             WHERE entry_id = (SELECT internal_id FROM entries WHERE id = ?1)
+               AND key_id = (SELECT internal_id FROM meta_keys WHERE key = ?2)",
+            params![entry_id.to_string(), key],
+        )?;
+        Ok(removed > 0)
+    }
+
+    /// Return one entry's meta attributes, sorted by key.
+    pub fn get_entry_meta(&self, entry_id: &EntryId) -> Result<std::collections::BTreeMap<String, String>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT mk.key, em.value FROM entry_meta em
+             JOIN meta_keys mk ON mk.internal_id = em.key_id
+             JOIN entries e ON e.internal_id = em.entry_id
+             WHERE e.id = ?1
+             ORDER BY mk.key",
+        )?;
+        let rows = stmt.query_map(params![entry_id.to_string()], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut meta = std::collections::BTreeMap::new();
+        for row in rows {
+            let (key, value) = row?;
+            meta.insert(key, value);
+        }
+        Ok(meta)
+    }
+
+    /// Return every meta key known to the store, sorted.
+    pub fn list_meta_keys(&self) -> Result<Vec<String>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare("SELECT key FROM meta_keys ORDER BY key")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut keys = Vec::new();
+        for row in rows {
+            keys.push(row?);
+        }
+        Ok(keys)
     }
 }
 
@@ -862,15 +1011,17 @@ mod tests {
         let tag = store.create_tag(Tag::new("t", "d")).unwrap();
         let tag_id = tag.id;
 
-        let e1 = Entry::new(
+        let mut e1 = Entry::new(
             "https://a.test",
-            Some("curl".to_string()),
-            Some("archives/a.html".to_string()),
             "first",
             vec![tag_id],
         );
-        let e2 = Entry::new("https://b.test", None, None, "second", vec![]);
-        let e3 = Entry::new("https://c.test", None, None, "third", vec![tag_id]);
+        e1.meta.insert("archived".to_string(), "true".to_string());
+        e1.meta.insert("archiver".to_string(), "curl".to_string());
+        e1.meta
+            .insert("archive_path".to_string(), "archives/a.html".to_string());
+        let e2 = Entry::new("https://b.test", "second", vec![]);
+        let e3 = Entry::new("https://c.test", "third", vec![tag_id]);
 
         let id1 = store.create_entry(e1).unwrap().id;
         let id2 = store.create_entry(e2).unwrap().id;
@@ -886,7 +1037,7 @@ mod tests {
         // find_entry_by_id loads tags
         let found = store.find_entry_by_id(&id1).unwrap().unwrap();
         assert_eq!(found.url, "https://a.test");
-        assert_eq!(found.archiver.as_deref(), Some("curl"));
+        assert_eq!(found.meta.get("archiver").map(String::as_str), Some("curl"));
         assert_eq!(found.tag_ids, vec![tag_id]);
         assert!(store.find_entry_by_id(&EntryId::new()).unwrap().is_none());
 
@@ -897,7 +1048,7 @@ mod tests {
             vec![id1, id3]
         );
 
-        // archiver filters
+        // archiver filters (via the `archiver` meta key)
         let no_archiver = store.find_entries(&[], Some(None)).unwrap();
         assert_eq!(
             no_archiver.iter().map(|e| e.id).collect::<Vec<_>>(),
@@ -905,6 +1056,8 @@ mod tests {
         );
         let curl = store.find_entries(&[], Some(Some("curl"))).unwrap();
         assert_eq!(curl.iter().map(|e| e.id).collect::<Vec<_>>(), vec![id1]);
+        let archived = store.find_entries(&[], Some(Some("curl"))).unwrap();
+        assert_eq!(archived[0].meta.get("archived").map(String::as_str), Some("true"));
 
         // add_tag_to_entry
         store.add_tag_to_entry(&id2, &tag_id).unwrap();
@@ -939,8 +1092,6 @@ mod tests {
         let earlier = store
             .create_entry(Entry::new(
                 "https://a.test",
-                None,
-                None,
                 "",
                 vec![first.id, second.id],
             ))
@@ -949,8 +1100,6 @@ mod tests {
         store
             .create_entry(Entry::new(
                 "https://b.test",
-                None,
-                None,
                 "",
                 vec![first.id, other.id],
             ))
@@ -958,8 +1107,6 @@ mod tests {
         let later = store
             .create_entry(Entry::new(
                 "https://c.test",
-                None,
-                None,
                 "",
                 vec![first.id, second.id],
             ))
@@ -982,19 +1129,19 @@ mod tests {
         let unknown = TagId::new();
 
         let e1 = store
-            .create_entry(Entry::new("https://ab.test", None, None, "", vec![a, b]))
+            .create_entry(Entry::new("https://ab.test", "", vec![a, b]))
             .unwrap()
             .id;
         let e2 = store
-            .create_entry(Entry::new("https://a.test", None, None, "", vec![a]))
+            .create_entry(Entry::new("https://a.test", "", vec![a]))
             .unwrap()
             .id;
         let e3 = store
-            .create_entry(Entry::new("https://b.test", None, None, "", vec![b]))
+            .create_entry(Entry::new("https://b.test", "", vec![b]))
             .unwrap()
             .id;
         let e4 = store
-            .create_entry(Entry::new("https://none.test", None, None, "", vec![]))
+            .create_entry(Entry::new("https://none.test", "", vec![]))
             .unwrap()
             .id;
 
@@ -1034,16 +1181,14 @@ mod tests {
             vec![e1, e2, e3, e4]
         );
         // Archiver filter still applies
-        let with_archiver = store
-            .create_entry(Entry::new(
-                "https://curl.test",
-                Some("curl".to_string()),
-                None,
-                "",
-                vec![a],
-            ))
-            .unwrap()
-            .id;
+        let mut with_archiver_entry = Entry::new("https://curl.test", "", vec![a]);
+        with_archiver_entry
+            .meta
+            .insert("archiver".to_string(), "curl".to_string());
+        with_archiver_entry
+            .meta
+            .insert("archived".to_string(), "true".to_string());
+        let with_archiver = store.create_entry(with_archiver_entry).unwrap().id;
         assert_eq!(
             store
                 .find_entries_by_query(&Query::Tag(a), Some(Some("curl")))
@@ -1065,8 +1210,6 @@ mod tests {
             store
                 .create_entry(Entry::new(
                     format!("https://e/{i}"),
-                    None,
-                    None,
                     "",
                     vec![a],
                 ))
@@ -1111,6 +1254,62 @@ mod tests {
     }
 
     #[test]
+    fn test_meta_set_get_remove() {
+        let (store, dir) = temp_store("meta_crud");
+        let tag = store.create_tag(Tag::new("t", "d")).unwrap();
+        let entry = Entry::new("https://example.com", "desc", vec![tag.id]);
+        let id = store.create_entry(entry).unwrap().id;
+
+        store
+            .set_entry_meta(&id, "archiver", "yt-dlp")
+            .expect("set meta");
+        store.set_entry_meta(&id, "archived", "true").expect("set");
+        let meta = store.get_entry_meta(&id).unwrap();
+        assert_eq!(meta.get("archiver").map(String::as_str), Some("yt-dlp"));
+        assert_eq!(meta.get("archived").map(String::as_str), Some("true"));
+
+        assert!(store.remove_entry_meta(&id, "archiver").unwrap());
+        assert!(!store.remove_entry_meta(&id, "archiver").unwrap()); // no-op
+        let meta2 = store.get_entry_meta(&id).unwrap();
+        assert!(meta2.get("archiver").is_none());
+        assert_eq!(meta2.get("archived").map(String::as_str), Some("true"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_query_meta_predicate() {
+        let (store, dir) = temp_store("meta_query");
+        let a = store.create_tag(Tag::new("a", "")).unwrap().id;
+        let mut e1 = Entry::new("https://e1", "", vec![a]);
+        e1.meta.insert("archiver".to_string(), "yt-dlp".to_string());
+        e1.meta.insert("archived".to_string(), "true".to_string());
+        let mut e2 = Entry::new("https://e2", "", vec![a]);
+        e2.meta.insert("archiver".to_string(), "curl".to_string());
+        let mut e3 = Entry::new("https://e3", "", vec![a]);
+        e3.meta.insert("extra".to_string(), "value".to_string());
+        let id1 = store.create_entry(e1).unwrap().id;
+        let _id2 = store.create_entry(e2).unwrap().id;
+        let _id3 = store.create_entry(e3).unwrap().id;
+
+        fn ids(store: &JsonlStore, query: &crate::query::ResolvedQuery) -> Vec<crate::domain::EntryId> {
+            store
+                .find_entries_by_query(query, None)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.id)
+                .collect()
+        }
+        use crate::query::Query;
+
+        assert_eq!(ids(&store, &Query::Meta { key: "archiver".to_string(), value: Some("yt-dlp".to_string()) }), vec![id1]);
+        assert_eq!(ids(&store, &Query::Meta { key: "archiver".to_string(), value: None }), vec![id1, _id2]);
+        assert_eq!(ids(&store, &Query::Meta { key: "nonexist".to_string(), value: None }), vec![]);
+        assert_eq!(ids(&store, &Query::Not(Box::new(Query::Meta { key: "archiver".to_string(), value: None }))), vec![_id3]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_is_empty_clear_all_import_bulk() {
         let (store, dir) = temp_store("bulk");
         assert!(store.is_empty().unwrap());
@@ -1119,8 +1318,6 @@ mod tests {
         let tag_id = tag.id;
         let entry = Entry::new(
             "https://x.test",
-            None,
-            None,
             "e",
             vec![tag_id, TagId::new()],
         );
@@ -1153,8 +1350,6 @@ mod tests {
             .map(|i| {
                 Entry::new(
                     format!("https://e/{i}"),
-                    None,
-                    None,
                     format!("d{i}"),
                     vec![],
                 )
