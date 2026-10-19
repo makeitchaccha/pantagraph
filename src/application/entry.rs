@@ -100,12 +100,15 @@ pub fn handle_entry_list(
     archiver: Option<String>,
     tag_refs: Vec<String>,
     query: Option<String>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    after: Option<String>,
 ) -> Result<EntryResult> {
     let archiver_filter = archiver
         .as_deref()
         .map(|name| if name.is_empty() { None } else { Some(name) });
 
-    let entries = match query {
+    let mut entries = match query {
         None => {
             let mut tag_ids = Vec::new();
             for tag_ref in &tag_refs {
@@ -132,6 +135,26 @@ pub fn handle_entry_list(
             store.find_entries_by_query(&combined, archiver_filter)?
         }
     };
+
+    if let Some(after_id) = after {
+        if let Ok(entry_id) = after_id.parse::<EntryId>() {
+            if let Some(pos) = entries.iter().position(|e| e.id == entry_id) {
+                entries.drain(..=pos);
+            }
+        }
+    }
+
+    let start = offset.unwrap_or(0);
+    if start > entries.len() {
+        entries.clear();
+    } else {
+        entries = entries.drain(start..).collect();
+    }
+    if let Some(limit) = limit {
+        if entries.len() > limit {
+            entries.truncate(limit);
+        }
+    }
 
     let names = tag_name_map(store)?;
     Ok(EntryResult::Listed { entries, names })

@@ -284,8 +284,13 @@ fn handle_tag_create_inner(
     Ok(TagResult::Created { tag, conflicts })
 }
 
-pub fn handle_tag_list(store: &JsonlStore, name_filter: Option<String>) -> Result<TagResult> {
-    let tags: Vec<Tag> = if let Some(ref filter) = name_filter {
+pub fn handle_tag_list(
+    store: &JsonlStore,
+    name_filter: Option<String>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+) -> Result<TagResult> {
+    let mut tags: Vec<Tag> = if let Some(ref filter) = name_filter {
         store
             .list_tags()?
             .into_iter()
@@ -297,6 +302,17 @@ pub fn handle_tag_list(store: &JsonlStore, name_filter: Option<String>) -> Resul
     } else {
         store.list_tags()?
     };
+    let start = offset.unwrap_or(0);
+    if start > tags.len() {
+        tags.clear();
+    } else {
+        tags = tags.drain(start..).collect();
+    }
+    if let Some(limit) = limit {
+        if tags.len() > limit {
+            tags.truncate(limit);
+        }
+    }
     Ok(TagResult::Listed(tags))
 }
 

@@ -164,7 +164,7 @@ impl App {
         if word.is_empty() {
             return;
         }
-        if let Ok(TagResult::Listed(mut tags)) = tag::handle_tag_list(store, Some(word)) {
+        if let Ok(TagResult::Listed(mut tags)) = tag::handle_tag_list(store, Some(word), None, None) {
             tags.truncate(SUGGESTION_LIMIT);
             self.suggestions = tags;
         }

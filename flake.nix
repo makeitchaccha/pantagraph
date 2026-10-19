@@ -27,6 +27,8 @@
               clippy
               rustc
               rustfmt
+
+              sqlite
             ];
           };
         }

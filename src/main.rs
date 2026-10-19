@@ -79,6 +79,12 @@ enum TagCommands {
         /// Filter by name or alias (substring match)
         #[arg(long)]
         name: Option<String>,
+        /// Maximum number of tags to return
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Number of tags to skip
+        #[arg(long)]
+        offset: Option<usize>,
     },
     /// Show tag details
     Show {
@@ -165,6 +171,15 @@ enum EntryCommands {
         /// Filter by query expression: space/* = AND, + = OR, ! = NOT (e.g. 'vocaloid KAITO !cover')
         #[arg(long)]
         query: Option<String>,
+        /// Maximum number of entries to return
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Number of entries to skip
+        #[arg(long)]
+        offset: Option<usize>,
+        /// Return entries after this ID (exclusive)
+        #[arg(long)]
+        after: Option<String>,
     },
     /// Show entry details
     Show {
@@ -204,8 +219,8 @@ fn run() -> Result<()> {
                 config.tag.same_qualified_ref_policy,
             )
             .map(present_tag_result),
-            TagCommands::List { name } => {
-                tag::handle_tag_list(&store, name).map(present_tag_result)
+            TagCommands::List { name, limit, offset } => {
+                tag::handle_tag_list(&store, name, limit, offset).map(present_tag_result)
             }
             TagCommands::Show { name_or_id } => {
                 tag::handle_tag_show(&store, name_or_id).map(present_tag_result)
@@ -244,7 +259,11 @@ fn run() -> Result<()> {
                 archiver,
                 tag,
                 query,
-            } => entry::handle_entry_list(&store, archiver, tag, query).map(present_entry_result),
+                limit,
+                offset,
+                after,
+            } => entry::handle_entry_list(&store, archiver, tag, query, limit, offset, after)
+                .map(present_entry_result),
             EntryCommands::Show { id } => {
                 entry::handle_entry_show(&store, id).map(present_entry_result)
             }
@@ -621,7 +640,7 @@ mod tests {
 
         // 4. Filter entries by alias
         assert!(
-            entry::handle_entry_list(&store, None, vec!["rust-lang".to_string()], None).is_ok()
+            entry::handle_entry_list(&store, None, vec!["rust-lang".to_string()], None, None, None, None).is_ok()
         );
 
         // 5. Add another tag and attach via alias using handle_entry_tag
@@ -665,7 +684,7 @@ mod tests {
         assert!(tag::handle_tag_show(&store, "rs".to_string()).is_ok());
 
         // 9. Tag list filter matches alias
-        assert!(tag::handle_tag_list(&store, Some("rust-lan".to_string())).is_ok());
+        assert!(tag::handle_tag_list(&store, Some("rust-lan".to_string()), None, None).is_ok());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -894,6 +913,9 @@ mod tests {
                 None,
                 tag_refs.iter().map(|s| s.to_string()).collect(),
                 query.map(str::to_string),
+                None,
+                None,
+                None,
             )
             .unwrap();
             match result {
@@ -917,14 +939,24 @@ mod tests {
         assert_eq!(search(Some("beta"), &["alpha"]), vec![ab]);
         assert_eq!(search(None, &["beta"]), vec![ab, b, bg]);
         // Malformed queries and unknown tags fail without panicking.
-        assert!(
-            entry::handle_entry_list(&store, None, vec![], Some("alpha +".to_string())).is_err()
-        );
         assert!(entry::handle_entry_list(
             &store,
             None,
             vec![],
-            Some("alpha missing-tag".to_string())
+            Some("alpha +".to_string()),
+            None,
+            None,
+            None
+        )
+        .is_err());
+        assert!(entry::handle_entry_list(
+            &store,
+            None,
+            vec![],
+            Some("alpha missing-tag".to_string()),
+            None,
+            None,
+            None
         )
         .is_err());
 
