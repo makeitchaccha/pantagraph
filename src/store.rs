@@ -337,11 +337,12 @@ impl JsonlStore {
                 ordinal
             ],
         )?;
-        let entry_id_str = entry.id.to_string();
         for tid in &entry.tag_ids {
             tx.execute(
-                "INSERT OR IGNORE INTO entry_tags (entry_id, tag_id) VALUES (?1, ?2)",
-                params![entry_id_str, tid.to_string()],
+                "INSERT OR IGNORE INTO entry_tags (entry_id, tag_id)
+                 SELECT e.internal_id, t.internal_id FROM entries e, tags t
+                 WHERE e.id = ?1 AND t.id = ?2",
+                params![entry.id.to_string(), tid.to_string()],
             )?;
         }
         tx.commit()?;
@@ -359,9 +360,13 @@ impl JsonlStore {
         let description: String = entry_row.get(4)?;
         let _ordinal: i64 = entry_row.get(5)?;
         let id = parse_uuid_id::<EntryId>(&id_str)?;
-        let mut stmt = conn.prepare("SELECT tag_id FROM entry_tags WHERE entry_id = ?1")?;
+        let mut stmt = conn.prepare(
+            "SELECT t.id FROM entry_tags et JOIN tags t ON t.internal_id = et.tag_id
+             WHERE et.entry_id = ?1",
+        )?;
         let mut tag_ids = Vec::new();
-        let rows = stmt.query_map(params![id.to_string()], |r| {
+        let internal_id: i64 = entry_row.get(6)?;
+        let rows = stmt.query_map(params![internal_id], |r| {
             let t: String = r.get(0)?;
             Ok(t)
         })?;
@@ -387,7 +392,7 @@ impl JsonlStore {
     pub fn find_entry_by_id(&self, id: &EntryId) -> Result<Option<Entry>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, url, archiver, archive_path, description, ordinal FROM entries WHERE id = ?1",
+            "SELECT id, url, archiver, archive_path, description, ordinal, internal_id FROM entries WHERE id = ?1",
         )?;
         let entry = stmt
             .query_row(params![id.to_string()], |row| {
@@ -414,7 +419,7 @@ impl JsonlStore {
         let tag_ids_str: Vec<String> = tag_ids.iter().map(|t| t.to_string()).collect();
         let mut entries: Vec<Entry> = if tag_ids.is_empty() {
             let mut stmt = conn.prepare(
-                "SELECT id, url, archiver, archive_path, description, ordinal FROM entries ORDER BY ordinal",
+                "SELECT id, url, archiver, archive_path, description, ordinal, internal_id FROM entries ORDER BY ordinal",
             )?;
             let rows = stmt.query_map([], |row| self.load_entry_with_tags(&conn, row))?;
             let mut v = Vec::new();
@@ -423,24 +428,39 @@ impl JsonlStore {
             }
             v
         } else {
-            let placeholders: Vec<String> = (0..tag_ids_str.len())
-                .map(|i| format!("?{}", i + 1))
-                .collect();
+            let mut internal_tag_ids = Vec::with_capacity(tag_ids_str.len());
+            for tag_id in tag_ids {
+                let internal_id = conn.query_row(
+                    "SELECT internal_id FROM tags WHERE id = ?1",
+                    params![tag_id.to_string()],
+                    |row| row.get::<_, i64>(0),
+                ).optional()?;
+                if let Some(internal_id) = internal_id {
+                    internal_tag_ids.push(internal_id);
+                } else {
+                    internal_tag_ids.clear();
+                    break;
+                }
+            }
             let sql = format!(
-                "SELECT e.id, e.url, e.archiver, e.archive_path, e.description, e.ordinal
+                "SELECT e.id, e.url, e.archiver, e.archive_path, e.description, e.ordinal, e.internal_id
                  FROM entries e
-                 JOIN entry_tags et ON et.entry_id = e.id
-                 WHERE et.tag_id IN ({})
-                 GROUP BY e.id
-                 HAVING COUNT(DISTINCT et.tag_id) = {}
+                 JOIN entry_tags candidate ON candidate.entry_id = e.internal_id
+                 WHERE candidate.tag_id = ?1{}
                  ORDER BY e.ordinal",
-                placeholders.join(","),
-                tag_ids_str.len()
+                (1..internal_tag_ids.len())
+                    .map(|i| format!(
+                        " AND EXISTS (SELECT 1 FROM entry_tags matching_{i}
+                         WHERE matching_{i}.entry_id = e.internal_id
+                           AND matching_{i}.tag_id = ?{})",
+                        i + 1
+                    ))
+                    .collect::<String>()
             );
             let mut stmt = conn.prepare(&sql)?;
             let mut params_vec: Vec<rusqlite::types::Value> = Vec::new();
-            for s in &tag_ids_str {
-                params_vec.push(rusqlite::types::Value::Text(s.clone()));
+            for internal_id in internal_tag_ids {
+                params_vec.push(rusqlite::types::Value::Integer(internal_id));
             }
             let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| {
                 self.load_entry_with_tags(&conn, row)
@@ -466,7 +486,9 @@ impl JsonlStore {
     pub fn add_tag_to_entry(&self, entry_id: &EntryId, tag_id: &TagId) -> Result<()> {
         let conn = self.conn()?;
         conn.execute(
-            "INSERT OR IGNORE INTO entry_tags (entry_id, tag_id) VALUES (?1, ?2)",
+            "INSERT OR IGNORE INTO entry_tags (entry_id, tag_id)
+             SELECT e.internal_id, t.internal_id FROM entries e, tags t
+             WHERE e.id = ?1 AND t.id = ?2",
             params![entry_id.to_string(), tag_id.to_string()],
         )?;
         Ok(())
@@ -520,9 +542,11 @@ impl JsonlStore {
             let mut entry_stmt = tx.prepare(
                 "INSERT INTO entries (id, url, archiver, archive_path, description, ordinal) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?;
-            let mut link_stmt =
-                tx.prepare("INSERT OR IGNORE INTO entry_tags (entry_id, tag_id) VALUES (?1, ?2)")?;
-            let mut tag_exists_stmt = tx.prepare("SELECT 1 FROM tags WHERE id = ?1")?;
+            let mut link_stmt = tx.prepare(
+                "INSERT OR IGNORE INTO entry_tags (entry_id, tag_id)
+                 SELECT e.internal_id, t.internal_id FROM entries e, tags t
+                 WHERE e.id = ?1 AND t.id = ?2",
+            )?;
             for (ordinal, entry) in entries.iter().enumerate() {
                 entry_stmt.execute(params![
                     entry.id.to_string(),
@@ -532,15 +556,9 @@ impl JsonlStore {
                     entry.description,
                     ordinal as i64
                 ])?;
-                let entry_id = entry.id.to_string();
                 for tag_id in &entry.tag_ids {
                     let tag_id_str = tag_id.to_string();
-                    let known: bool = tag_exists_stmt
-                        .query_row(params![tag_id_str], |_| Ok(true))
-                        .unwrap_or(false);
-                    if known {
-                        link_stmt.execute(params![entry_id, tag_id_str])?;
-                    }
+                    link_stmt.execute(params![entry.id.to_string(), tag_id_str])?;
                 }
             }
         }
@@ -670,6 +688,22 @@ mod tests {
         store.add_tag_to_entry(&id2, &tag_id).unwrap();
         assert_eq!(store.find_entries_by_tag(&tag_id).unwrap().len(), 3);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_find_entries_requires_all_resolved_tags() {
+        let (store, dir) = temp_store("tag_intersection");
+        let first = store.create_tag(Tag::with_specifier("shared", Some("one".into()), "", vec![])).unwrap();
+        let second = store.create_tag(Tag::with_specifier("shared", Some("two".into()), "", vec![])).unwrap();
+        let other = store.create_tag(Tag::new("other", "")).unwrap();
+
+        let earlier = store.create_entry(Entry::new("https://a.test", None, None, "", vec![first.id, second.id])).unwrap().id;
+        store.create_entry(Entry::new("https://b.test", None, None, "", vec![first.id, other.id])).unwrap();
+        let later = store.create_entry(Entry::new("https://c.test", None, None, "", vec![first.id, second.id])).unwrap().id;
+
+        let found = store.find_entries(&[first.id, second.id], None).unwrap();
+        assert_eq!(found.iter().map(|entry| entry.id).collect::<Vec<_>>(), vec![earlier, later]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
