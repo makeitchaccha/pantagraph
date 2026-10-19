@@ -962,4 +962,104 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn test_handle_entry_list_limit_offset_after() {
+        let dir = std::env::temp_dir().join(format!(
+            "pantagraph_test_entry_limit_offset_after_{}",
+            uuid::Uuid::now_v7()
+        ));
+        let store = JsonlStore::new(&dir).unwrap();
+
+        let alpha = store.create_tag(Tag::new("alpha", "")).unwrap().id;
+        let beta = store.create_tag(Tag::new("beta", "")).unwrap().id;
+
+        let ids = |tag_ids: Vec<TagId>| {
+            store
+                .create_entry(Entry::new("https://x.test", None, None, "", tag_ids))
+                .unwrap()
+                .id
+        };
+        let e0 = ids(vec![alpha]);
+        let e1 = ids(vec![alpha, beta]);
+        let e2 = ids(vec![beta]);
+        let e3 = ids(vec![]);
+        let e4 = ids(vec![alpha]);
+
+        let list = |tag_refs: &[&str],
+                    query: Option<&str>,
+                    limit: Option<usize>,
+                    offset: Option<usize>,
+                    after: Option<&str>| {
+            let result = entry::handle_entry_list(
+                &store,
+                None,
+                tag_refs.iter().map(|s| s.to_string()).collect(),
+                query.map(str::to_string),
+                limit,
+                offset,
+                after.map(str::to_string),
+            )
+            .unwrap();
+            match result {
+                entry::EntryResult::Listed { entries, .. } => {
+                    entries.iter().map(|e| e.id).collect::<Vec<_>>()
+                }
+                _ => panic!("expected Listed result"),
+            }
+        };
+
+        // limit alone truncates from the start.
+        assert_eq!(list(&[], None, Some(2), None, None), vec![e0, e1]);
+        // offset alone skips from the start.
+        assert_eq!(list(&[], None, None, Some(3), None), vec![e3, e4]);
+        // limit + offset together.
+        assert_eq!(list(&[], None, Some(2), Some(1), None), vec![e1, e2]);
+        // offset beyond the end returns nothing.
+        assert_eq!(
+            list(&[], None, Some(5), Some(10), None),
+            Vec::<domain::EntryId>::new()
+        );
+        // after (unfiltered) returns entries strictly after the anchor.
+        let e1_str = e1.to_string();
+        assert_eq!(list(&[], None, None, None, Some(&e1_str)), vec![e2, e3, e4]);
+        // after + limit combines.
+        assert_eq!(
+            list(&[], None, Some(2), None, Some(&e1_str)),
+            vec![e2, e3]
+        );
+        // after + offset combines.
+        assert_eq!(
+            list(&[], None, None, Some(1), Some(&e1_str)),
+            vec![e3, e4]
+        );
+        // after on an unknown / malformed id is a no-op.
+        assert_eq!(
+            list(&[], None, Some(2), None, Some("not-a-uuid")),
+            vec![e0, e1]
+        );
+        // after with a tag filter still works (falls back to in-memory path).
+        // Entries with `alpha`: e0, e1, e4.
+        let a_only = vec![e0, e1, e4];
+        assert_eq!(
+            list(&["alpha"], None, None, None, Some(&e0.to_string())),
+            vec![e1, e4]
+        );
+        assert_eq!(
+            list(&["alpha"], None, Some(1), None, Some(&e0.to_string())),
+            vec![e1]
+        );
+        assert_eq!(list(&["alpha"], None, None, None, None), a_only);
+        // after with a query still works (falls back to in-memory path).
+        assert_eq!(
+            list(&[], Some("alpha"), None, None, Some(&e0.to_string())),
+            vec![e1, e4]
+        );
+        assert_eq!(
+            list(&[], Some("alpha"), Some(1), None, Some(&e0.to_string())),
+            vec![e1]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

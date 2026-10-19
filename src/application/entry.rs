@@ -108,6 +108,41 @@ pub fn handle_entry_list(
         .as_deref()
         .map(|name| if name.is_empty() { None } else { Some(name) });
 
+    // Resolve `--after` to an offset into the ordinal-ordered result set,
+    // when possible: ordinals are contiguous integers assigned at insert
+    // time (see `find_entry_ordinal`), so an entry's ordinal is directly
+    // usable as a SQL OFFSET for "entries after this one" — but only in
+    // the unfiltered case (no `-t` tags, no `--query`), where the result
+    // set is the full table and ordinals are dense 0..N-1. With a tag
+    // filter or query, the filtered subset has ordinal gaps, so an
+    // ordinal can't be reused as a row offset. If the anchor entry doesn't
+    // exist, treat `--after` as a no-op (matching prior in-memory
+    // behavior, which only filtered when the id was found).
+    let unfiltered = tag_refs.is_empty() && query.is_none();
+    let mut after_offset = 0usize;
+    let mut after_resolved = false;
+    if unfiltered {
+        if let Some(after_id) = &after {
+            if let Ok(entry_id) = after_id.parse::<EntryId>() {
+                if let Some(ordinal) = store.find_entry_ordinal(&entry_id)? {
+                    after_offset = (ordinal as usize) + 1;
+                    after_resolved = true;
+                }
+            }
+        }
+    }
+
+    // Push `limit`/`offset` into SQL when it's safe: no in-memory archiver
+    // filter (which runs after the query and would make a SQL-level LIMIT
+    // incorrect) and `--after` resolved cleanly to an offset above. Only
+    // push when there is a `limit`; offset alone doesn't reduce rows
+    // fetched from SQL, so it isn't worth the SQL-level pushdown.
+    let sql_page = if archiver_filter.is_none() && (after.is_none() || after_resolved) {
+        limit.map(|limit| (limit, offset.unwrap_or(0) + after_offset))
+    } else {
+        None
+    };
+
     let mut entries = match query {
         None => {
             let mut tag_ids = Vec::new();
@@ -116,7 +151,7 @@ pub fn handle_entry_list(
                 tag_ids.push(tag.id);
             }
             // `entry list -t a -t b` means entries must have both tags.
-            store.find_entries(&tag_ids, archiver_filter)?
+            store.find_entries_page(&tag_ids, archiver_filter, sql_page)?
         }
         Some(query_str) => {
             let parsed = query::parse(&query_str)?;
@@ -132,27 +167,32 @@ pub fn handle_entry_list(
             } else {
                 Query::And(clauses)
             };
-            store.find_entries_by_query(&combined, archiver_filter)?
+            store.find_entries_by_query_page_opt(&combined, archiver_filter, sql_page)?
         }
     };
 
-    if let Some(after_id) = after {
-        if let Ok(entry_id) = after_id.parse::<EntryId>() {
-            if let Some(pos) = entries.iter().position(|e| e.id == entry_id) {
-                entries.drain(..=pos);
+    // If the page was already pushed into SQL (including a resolved
+    // `--after` offset), skip re-applying the offset and limit in memory
+    // below.
+    if sql_page.is_none() {
+        if let Some(after_id) = after {
+            if let Ok(entry_id) = after_id.parse::<EntryId>() {
+                if let Some(pos) = entries.iter().position(|e| e.id == entry_id) {
+                    entries.drain(..=pos);
+                }
             }
         }
-    }
 
-    let start = offset.unwrap_or(0);
-    if start > entries.len() {
-        entries.clear();
-    } else {
-        entries = entries.drain(start..).collect();
-    }
-    if let Some(limit) = limit {
-        if entries.len() > limit {
-            entries.truncate(limit);
+        let start = offset.unwrap_or(0);
+        if start > entries.len() {
+            entries.clear();
+        } else {
+            entries = entries.drain(start..).collect();
+        }
+        if let Some(limit) = limit {
+            if entries.len() > limit {
+                entries.truncate(limit);
+            }
         }
     }
 
