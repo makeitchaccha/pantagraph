@@ -3,6 +3,7 @@ use std::fmt;
 
 use crate::config::DuplicatePolicy;
 use crate::domain::{Tag, TagId};
+use crate::query::{Query, ResolvedQuery};
 use crate::store::JsonlStore;
 
 #[derive(Debug)]
@@ -125,6 +126,30 @@ pub fn resolve_tag(store: &JsonlStore, name_or_id: &str) -> Result<Tag> {
             bail!("Multiple tags match '{name_or_id}':\n{candidates}\nAmbiguous tag name. Use {name_or_id}#N (or specify @specifier) to disambiguate.");
         }
     }
+}
+
+/// Resolve every tag reference in a parsed query to a [`TagId`].
+///
+/// Resolution uses the same rules as `-t` references, including `#N`
+/// and `@specifier` disambiguation.
+pub fn resolve_query(store: &JsonlStore, query: &Query) -> Result<ResolvedQuery> {
+    let resolved = match query {
+        Query::Tag(tag_ref) => Query::Tag(resolve_tag(store, tag_ref)?.id),
+        Query::And(queries) => Query::And(
+            queries
+                .iter()
+                .map(|q| resolve_query(store, q))
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        Query::Or(queries) => Query::Or(
+            queries
+                .iter()
+                .map(|q| resolve_query(store, q))
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        Query::Not(inner) => Query::Not(Box::new(resolve_query(store, inner)?)),
+    };
+    Ok(resolved)
 }
 
 pub fn handle_tag_create(

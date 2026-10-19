@@ -1,7 +1,7 @@
 mod application;
 mod config;
 
-use pantagraph::{archiver, domain, store};
+use pantagraph::{archiver, domain, query, store};
 
 use std::collections::HashMap;
 
@@ -151,7 +151,7 @@ enum EntryCommands {
         #[arg(long, short)]
         tag: Vec<String>,
     },
-    /// List entries, optionally filtered by tag(s) or archiver
+    /// List entries, optionally filtered by tag(s), query, or archiver
     List {
         /// Filter by archiver name
         #[arg(long)]
@@ -159,6 +159,9 @@ enum EntryCommands {
         /// Filter by tag (name or ID, repeatable — entries must match ALL)
         #[arg(long, short)]
         tag: Vec<String>,
+        /// Filter by query expression: space/* = AND, + = OR, ! = NOT (e.g. 'vocaloid KAITO !cover')
+        #[arg(long)]
+        query: Option<String>,
     },
     /// Show entry details
     Show {
@@ -234,9 +237,11 @@ fn run() -> Result<()> {
                 tag,
             } => entry::handle_entry_add(&store, archiver, url, description, tag)
                 .map(present_entry_result),
-            EntryCommands::List { archiver, tag } => {
-                entry::handle_entry_list(&store, archiver, tag).map(present_entry_result)
-            }
+            EntryCommands::List {
+                archiver,
+                tag,
+                query,
+            } => entry::handle_entry_list(&store, archiver, tag, query).map(present_entry_result),
             EntryCommands::Show { id } => {
                 entry::handle_entry_show(&store, id).map(present_entry_result)
             }
@@ -611,7 +616,9 @@ mod tests {
         assert_eq!(entries[0].tag_ids, vec![resolved.id]);
 
         // 4. Filter entries by alias
-        assert!(entry::handle_entry_list(&store, None, vec!["rust-lang".to_string()]).is_ok());
+        assert!(
+            entry::handle_entry_list(&store, None, vec!["rust-lang".to_string()], None).is_ok()
+        );
 
         // 5. Add another tag and attach via alias using handle_entry_tag
         assert!(tag::handle_tag_create(
@@ -847,6 +854,73 @@ mod tests {
             vec![],
             DuplicatePolicy::Error,
             DuplicatePolicy::Error,
+        )
+        .is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_handle_entry_list_query() {
+        let dir = std::env::temp_dir().join(format!(
+            "pantagraph_test_entry_query_{}",
+            uuid::Uuid::now_v7()
+        ));
+        let store = JsonlStore::new(&dir).unwrap();
+
+        let alpha = store.create_tag(Tag::new("alpha", "")).unwrap().id;
+        let beta = store.create_tag(Tag::new("beta", "")).unwrap().id;
+        let gamma = store.create_tag(Tag::new("gamma", "")).unwrap().id;
+
+        let ids = |tag_ids: Vec<TagId>| {
+            store
+                .create_entry(Entry::new("https://x.test", None, None, "", tag_ids))
+                .unwrap()
+                .id
+        };
+        let ab = ids(vec![alpha, beta]);
+        let a = ids(vec![alpha]);
+        let b = ids(vec![beta]);
+        let bg = ids(vec![beta, gamma]);
+        let g = ids(vec![gamma]);
+
+        let search = |query: Option<&str>, tag_refs: &[&str]| {
+            let result = entry::handle_entry_list(
+                &store,
+                None,
+                tag_refs.iter().map(|s| s.to_string()).collect(),
+                query.map(str::to_string),
+            )
+            .unwrap();
+            match result {
+                entry::EntryResult::Listed { entries, .. } => {
+                    entries.iter().map(|e| e.id).collect::<Vec<_>>()
+                }
+                _ => panic!("expected Listed result"),
+            }
+        };
+
+        // Implicit AND and explicit * return the same entries.
+        assert_eq!(search(Some("alpha beta"), &[]), vec![ab]);
+        assert_eq!(search(Some("alpha * beta"), &[]), vec![ab]);
+        // `A + B C` is parsed as `A + (B * C)`.
+        assert_eq!(search(Some("alpha + beta gamma"), &[]), vec![ab, a, bg]);
+        assert_eq!(search(Some("alpha + beta"), &[]), vec![ab, a, b, bg]);
+        // `A * !B` returns entries with A but without B.
+        assert_eq!(search(Some("alpha * !beta"), &[]), vec![a]);
+        assert_eq!(search(Some("!alpha"), &[]), vec![b, bg, g]);
+        // `-t` tags combine with the query via AND.
+        assert_eq!(search(Some("beta"), &["alpha"]), vec![ab]);
+        assert_eq!(search(None, &["beta"]), vec![ab, b, bg]);
+        // Malformed queries and unknown tags fail without panicking.
+        assert!(
+            entry::handle_entry_list(&store, None, vec![], Some("alpha +".to_string())).is_err()
+        );
+        assert!(entry::handle_entry_list(
+            &store,
+            None,
+            vec![],
+            Some("alpha missing-tag".to_string())
         )
         .is_err());
 

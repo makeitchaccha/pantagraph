@@ -4,9 +4,10 @@ use anyhow::{Context, Result};
 
 use crate::archiver::ToolConfig;
 use crate::domain::{Entry, EntryId, TagId};
+use crate::query::{self, Query, ResolvedQuery};
 use crate::store::JsonlStore;
 
-use super::tag::resolve_tag;
+use super::tag::{resolve_query, resolve_tag};
 
 #[derive(Debug)]
 pub enum EntryResult {
@@ -86,17 +87,39 @@ pub fn handle_entry_list(
     store: &JsonlStore,
     archiver: Option<String>,
     tag_refs: Vec<String>,
+    query: Option<String>,
 ) -> Result<EntryResult> {
-    let mut tag_ids = Vec::new();
-    for tag_ref in &tag_refs {
-        let tag = resolve_tag(store, tag_ref)?;
-        tag_ids.push(tag.id);
-    }
-    // `entry list -t a -t b` means entries must have both tags.
     let archiver_filter = archiver
         .as_deref()
         .map(|name| if name.is_empty() { None } else { Some(name) });
-    let entries = store.find_entries(&tag_ids, archiver_filter)?;
+
+    let entries = match query {
+        None => {
+            let mut tag_ids = Vec::new();
+            for tag_ref in &tag_refs {
+                let tag = resolve_tag(store, tag_ref)?;
+                tag_ids.push(tag.id);
+            }
+            // `entry list -t a -t b` means entries must have both tags.
+            store.find_entries(&tag_ids, archiver_filter)?
+        }
+        Some(query_str) => {
+            let parsed = query::parse(&query_str)?;
+            let resolved = resolve_query(store, &parsed)?;
+            // `-t` tags are additional ANDed constraints alongside the query.
+            let mut clauses: Vec<ResolvedQuery> = Vec::with_capacity(tag_refs.len() + 1);
+            for tag_ref in &tag_refs {
+                clauses.push(Query::Tag(resolve_tag(store, tag_ref)?.id));
+            }
+            clauses.push(resolved);
+            let combined = if clauses.len() == 1 {
+                clauses.remove(0)
+            } else {
+                Query::And(clauses)
+            };
+            store.find_entries_by_query(&combined, archiver_filter)?
+        }
+    };
 
     let names = tag_name_map(store)?;
     Ok(EntryResult::Listed { entries, names })

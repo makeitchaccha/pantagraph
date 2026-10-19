@@ -1,7 +1,9 @@
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::db;
 use crate::domain::{Entry, EntryId, Tag, TagId};
+use crate::query::{Query, ResolvedQuery};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -12,6 +14,26 @@ pub(crate) enum ArchiverFilter<'a> {
     Named(&'a str),
 }
 
+fn to_archiver_filter<'a>(archiver: Option<Option<&'a str>>) -> ArchiverFilter<'a> {
+    match archiver {
+        None => ArchiverFilter::Any,
+        Some(None) => ArchiverFilter::WithoutArchiver,
+        Some(Some(name)) => ArchiverFilter::Named(name),
+    }
+}
+
+fn apply_archiver_filter(entries: &mut Vec<Entry>, filter: ArchiverFilter<'_>) {
+    match filter {
+        ArchiverFilter::Any => {}
+        ArchiverFilter::WithoutArchiver => {
+            entries.retain(|e| e.archiver.is_none());
+        }
+        ArchiverFilter::Named(name) => {
+            entries.retain(|e| e.archiver.as_deref() == Some(name));
+        }
+    }
+}
+
 fn parse_uuid_id<T: std::str::FromStr>(s: &str) -> rusqlite::Result<T>
 where
     T::Err: std::error::Error + Send + Sync + 'static,
@@ -19,6 +41,71 @@ where
     s.parse::<T>().map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
     })
+}
+
+fn collect_tag_ids(query: &ResolvedQuery, out: &mut HashSet<TagId>) {
+    match query {
+        Query::Tag(tag_id) => {
+            out.insert(*tag_id);
+        }
+        Query::And(queries) | Query::Or(queries) => {
+            for q in queries {
+                collect_tag_ids(q, out);
+            }
+        }
+        Query::Not(inner) => collect_tag_ids(inner, out),
+    }
+}
+
+/// Translate query set semantics into a SQL boolean expression over `e`.
+///
+/// `params` receives one internal tag id per positive tag reference, in
+/// the order their `?N` placeholders appear. Tag ids missing from
+/// `internal_ids` match nothing, so `NOT` over them matches everything.
+fn query_predicate(
+    query: &ResolvedQuery,
+    internal_ids: &HashMap<TagId, i64>,
+    params: &mut Vec<rusqlite::types::Value>,
+    counter: &mut usize,
+) -> String {
+    match query {
+        Query::Tag(tag_id) => match internal_ids.get(tag_id) {
+            Some(internal_id) => {
+                *counter += 1;
+                let n = *counter;
+                params.push(rusqlite::types::Value::Integer(*internal_id));
+                format!(
+                    "EXISTS (SELECT 1 FROM entry_tags m{n}
+                     WHERE m{n}.entry_id = e.internal_id
+                       AND m{n}.tag_id = ?{})",
+                    params.len()
+                )
+            }
+            None => "0".to_string(),
+        },
+        Query::And(queries) if queries.is_empty() => "1".to_string(),
+        Query::Or(queries) if queries.is_empty() => "0".to_string(),
+        Query::And(queries) => format!(
+            "({})",
+            queries
+                .iter()
+                .map(|q| query_predicate(q, internal_ids, params, counter))
+                .collect::<Vec<_>>()
+                .join(" AND ")
+        ),
+        Query::Or(queries) => format!(
+            "({})",
+            queries
+                .iter()
+                .map(|q| query_predicate(q, internal_ids, params, counter))
+                .collect::<Vec<_>>()
+                .join(" OR ")
+        ),
+        Query::Not(inner) => format!(
+            "(NOT {})",
+            query_predicate(inner, internal_ids, params, counter)
+        ),
+    }
 }
 
 /// Store backed by SQLite (primary source of truth).
@@ -411,11 +498,7 @@ impl JsonlStore {
         archiver: Option<Option<&str>>,
     ) -> Result<Vec<Entry>> {
         let conn = self.conn()?;
-        let archiver_filter = match archiver {
-            None => ArchiverFilter::Any,
-            Some(None) => ArchiverFilter::WithoutArchiver,
-            Some(Some(name)) => ArchiverFilter::Named(name),
-        };
+        let archiver_filter = to_archiver_filter(archiver);
         let tag_ids_str: Vec<String> = tag_ids.iter().map(|t| t.to_string()).collect();
         let mut entries: Vec<Entry> = if tag_ids.is_empty() {
             let mut stmt = conn.prepare(
@@ -430,11 +513,13 @@ impl JsonlStore {
         } else {
             let mut internal_tag_ids = Vec::with_capacity(tag_ids_str.len());
             for tag_id in tag_ids {
-                let internal_id = conn.query_row(
-                    "SELECT internal_id FROM tags WHERE id = ?1",
-                    params![tag_id.to_string()],
-                    |row| row.get::<_, i64>(0),
-                ).optional()?;
+                let internal_id = conn
+                    .query_row(
+                        "SELECT internal_id FROM tags WHERE id = ?1",
+                        params![tag_id.to_string()],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?;
                 if let Some(internal_id) = internal_id {
                     internal_tag_ids.push(internal_id);
                 } else {
@@ -472,17 +557,59 @@ impl JsonlStore {
             v
         };
 
-        match archiver_filter {
-            ArchiverFilter::Any => {}
-            ArchiverFilter::WithoutArchiver => {
-                entries.retain(|e| e.archiver.is_none());
-            }
-            ArchiverFilter::Named(name) => {
-                entries.retain(|e| e.archiver.as_deref() == Some(name));
-            }
-        }
+        apply_archiver_filter(&mut entries, archiver_filter);
         Ok(entries)
     }
+
+    /// Find entries whose tags satisfy a boolean query.
+    ///
+    /// `And` is intersection, `Or` is union, `Not` is the complement over
+    /// all entries. Tag ids absent from the store match nothing.
+    pub fn find_entries_by_query(
+        &self,
+        query: &ResolvedQuery,
+        archiver: Option<Option<&str>>,
+    ) -> Result<Vec<Entry>> {
+        let conn = self.conn()?;
+        let archiver_filter = to_archiver_filter(archiver);
+
+        let mut tag_ids = HashSet::new();
+        collect_tag_ids(query, &mut tag_ids);
+        let mut internal_ids = HashMap::with_capacity(tag_ids.len());
+        for tag_id in tag_ids {
+            let internal_id = conn
+                .query_row(
+                    "SELECT internal_id FROM tags WHERE id = ?1",
+                    params![tag_id.to_string()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            if let Some(internal_id) = internal_id {
+                internal_ids.insert(tag_id, internal_id);
+            }
+        }
+
+        let mut params_vec = Vec::new();
+        let mut counter = 0;
+        let predicate = query_predicate(query, &internal_ids, &mut params_vec, &mut counter);
+        let sql = format!(
+            "SELECT e.id, e.url, e.archiver, e.archive_path, e.description, e.ordinal, e.internal_id
+             FROM entries e
+             WHERE {predicate}
+             ORDER BY e.ordinal"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| {
+            self.load_entry_with_tags(&conn, row)
+        })?;
+        let mut entries = Vec::new();
+        for r in rows {
+            entries.push(r?);
+        }
+        apply_archiver_filter(&mut entries, archiver_filter);
+        Ok(entries)
+    }
+
     pub fn add_tag_to_entry(&self, entry_id: &EntryId, tag_id: &TagId) -> Result<()> {
         let conn = self.conn()?;
         conn.execute(
@@ -694,16 +821,142 @@ mod tests {
     #[test]
     fn test_find_entries_requires_all_resolved_tags() {
         let (store, dir) = temp_store("tag_intersection");
-        let first = store.create_tag(Tag::with_specifier("shared", Some("one".into()), "", vec![])).unwrap();
-        let second = store.create_tag(Tag::with_specifier("shared", Some("two".into()), "", vec![])).unwrap();
+        let first = store
+            .create_tag(Tag::with_specifier(
+                "shared",
+                Some("one".into()),
+                "",
+                vec![],
+            ))
+            .unwrap();
+        let second = store
+            .create_tag(Tag::with_specifier(
+                "shared",
+                Some("two".into()),
+                "",
+                vec![],
+            ))
+            .unwrap();
         let other = store.create_tag(Tag::new("other", "")).unwrap();
 
-        let earlier = store.create_entry(Entry::new("https://a.test", None, None, "", vec![first.id, second.id])).unwrap().id;
-        store.create_entry(Entry::new("https://b.test", None, None, "", vec![first.id, other.id])).unwrap();
-        let later = store.create_entry(Entry::new("https://c.test", None, None, "", vec![first.id, second.id])).unwrap().id;
+        let earlier = store
+            .create_entry(Entry::new(
+                "https://a.test",
+                None,
+                None,
+                "",
+                vec![first.id, second.id],
+            ))
+            .unwrap()
+            .id;
+        store
+            .create_entry(Entry::new(
+                "https://b.test",
+                None,
+                None,
+                "",
+                vec![first.id, other.id],
+            ))
+            .unwrap();
+        let later = store
+            .create_entry(Entry::new(
+                "https://c.test",
+                None,
+                None,
+                "",
+                vec![first.id, second.id],
+            ))
+            .unwrap()
+            .id;
 
         let found = store.find_entries(&[first.id, second.id], None).unwrap();
-        assert_eq!(found.iter().map(|entry| entry.id).collect::<Vec<_>>(), vec![earlier, later]);
+        assert_eq!(
+            found.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            vec![earlier, later]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_find_entries_by_query_set_operations() {
+        let (store, dir) = temp_store("query_sets");
+        let a = store.create_tag(Tag::new("a", "")).unwrap().id;
+        let b = store.create_tag(Tag::new("b", "")).unwrap().id;
+        let unknown = TagId::new();
+
+        let e1 = store
+            .create_entry(Entry::new("https://ab.test", None, None, "", vec![a, b]))
+            .unwrap()
+            .id;
+        let e2 = store
+            .create_entry(Entry::new("https://a.test", None, None, "", vec![a]))
+            .unwrap()
+            .id;
+        let e3 = store
+            .create_entry(Entry::new("https://b.test", None, None, "", vec![b]))
+            .unwrap()
+            .id;
+        let e4 = store
+            .create_entry(Entry::new("https://none.test", None, None, "", vec![]))
+            .unwrap()
+            .id;
+
+        let ids = |query: &ResolvedQuery| {
+            store
+                .find_entries_by_query(query, None)
+                .unwrap()
+                .iter()
+                .map(|e| e.id)
+                .collect::<Vec<_>>()
+        };
+
+        // Intersection
+        assert_eq!(
+            ids(&Query::And(vec![Query::Tag(a), Query::Tag(b)])),
+            vec![e1]
+        );
+        // Union
+        assert_eq!(
+            ids(&Query::Or(vec![Query::Tag(a), Query::Tag(b)])),
+            vec![e1, e2, e3]
+        );
+        // Difference via NOT
+        assert_eq!(
+            ids(&Query::And(vec![
+                Query::Tag(a),
+                Query::Not(Box::new(Query::Tag(b)))
+            ])),
+            vec![e2]
+        );
+        // Complement over all entries
+        assert_eq!(ids(&Query::Not(Box::new(Query::Tag(a)))), vec![e3, e4]);
+        // Unknown tag ids match nothing; their complement matches everything
+        assert!(ids(&Query::Tag(unknown)).is_empty());
+        assert_eq!(
+            ids(&Query::Not(Box::new(Query::Tag(unknown)))),
+            vec![e1, e2, e3, e4]
+        );
+        // Archiver filter still applies
+        let with_archiver = store
+            .create_entry(Entry::new(
+                "https://curl.test",
+                Some("curl".to_string()),
+                None,
+                "",
+                vec![a],
+            ))
+            .unwrap()
+            .id;
+        assert_eq!(
+            store
+                .find_entries_by_query(&Query::Tag(a), Some(Some("curl")))
+                .unwrap()
+                .iter()
+                .map(|e| e.id)
+                .collect::<Vec<_>>(),
+            vec![with_archiver]
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
