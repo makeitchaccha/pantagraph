@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use crate::archiver::ToolConfig;
 use crate::domain::{Entry, EntryId, TagId};
 use crate::query::{self, Query, ResolvedQuery};
-use crate::store::JsonlStore;
+use crate::store::Store;
 
 use super::tag::{resolve_query, resolve_tag};
 
@@ -57,7 +57,7 @@ pub enum EntryResult {
 }
 
 /// Build a TagId → display name lookup from all tags.
-fn tag_name_map(store: &JsonlStore) -> Result<HashMap<TagId, String>> {
+fn tag_name_map(store: &Store) -> Result<HashMap<TagId, String>> {
     Ok(store
         .list_tags()?
         .into_iter()
@@ -66,7 +66,7 @@ fn tag_name_map(store: &JsonlStore) -> Result<HashMap<TagId, String>> {
 }
 
 pub fn handle_entry_add(
-    store: &JsonlStore,
+    store: &Store,
     archiver: String,
     url: String,
     description: String,
@@ -109,7 +109,7 @@ pub fn handle_entry_add(
 }
 
 pub fn handle_entry_list(
-    store: &JsonlStore,
+    store: &Store,
     archiver: Option<String>,
     tag_refs: Vec<String>,
     query: Option<String>,
@@ -219,7 +219,7 @@ pub fn handle_entry_list(
 /// A blank query matches all entries, mirroring `entry list` without
 /// `--query`. One extra row is fetched to report whether a further page
 /// exists, then the page is truncated to [`SEARCH_PAGE_SIZE`].
-pub fn handle_entry_search_page(store: &JsonlStore, query: &str, page: usize) -> Result<EntryPage> {
+pub fn handle_entry_search_page(store: &Store, query: &str, page: usize) -> Result<EntryPage> {
     let trimmed = query.trim();
     let resolved = if trimmed.is_empty() {
         Query::And(Vec::new())
@@ -241,7 +241,7 @@ pub fn handle_entry_search_page(store: &JsonlStore, query: &str, page: usize) ->
     })
 }
 
-pub fn handle_entry_show(store: &JsonlStore, id: String) -> Result<EntryResult> {
+pub fn handle_entry_show(store: &Store, id: String) -> Result<EntryResult> {
     let entry_id: EntryId = id.parse().context("Invalid entry ID")?;
     let entry = store
         .find_entry_by_id(&entry_id)?
@@ -252,7 +252,7 @@ pub fn handle_entry_show(store: &JsonlStore, id: String) -> Result<EntryResult> 
 }
 
 pub fn handle_entry_tag(
-    store: &JsonlStore,
+    store: &Store,
     entry_id: String,
     tag_ref: String,
 ) -> Result<EntryResult> {
@@ -268,7 +268,7 @@ pub fn handle_entry_tag(
 
 /// Set `key = value` on an entry's meta attributes.
 pub fn handle_entry_meta_set(
-    store: &JsonlStore,
+    store: &Store,
     entry_id: String,
     key: String,
     value: String,
@@ -285,7 +285,7 @@ pub fn handle_entry_meta_set(
 
 /// Remove `key` from an entry's meta attributes.
 pub fn handle_entry_meta_remove(
-    store: &JsonlStore,
+    store: &Store,
     entry_id: String,
     key: String,
 ) -> Result<EntryResult> {
@@ -301,7 +301,7 @@ pub fn handle_entry_meta_remove(
 
 /// List one entry's meta attributes.
 pub fn handle_entry_meta_list(
-    store: &JsonlStore,
+    store: &Store,
     entry_id: String,
 ) -> Result<EntryResult> {
     let eid: EntryId = entry_id.parse().context("Invalid entry ID")?;

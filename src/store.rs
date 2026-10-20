@@ -156,12 +156,12 @@ fn query_predicate(
 }
 
 /// Store backed by SQLite (primary source of truth).
-pub struct JsonlStore {
+pub struct Store {
     data_dir: PathBuf,
     db_path: PathBuf,
 }
 
-impl JsonlStore {
+impl Store {
     pub fn new(data_dir: impl Into<PathBuf>) -> Result<Self> {
         let data_dir = data_dir.into();
         std::fs::create_dir_all(&data_dir)
@@ -944,12 +944,12 @@ impl JsonlStore {
 mod tests {
     use super::*;
 
-    fn temp_store(tag: &str) -> (JsonlStore, PathBuf) {
+    fn temp_store(tag: &str) -> (Store, PathBuf) {
         let dir = std::env::temp_dir().join(format!(
             "pantagraph_test_store_{tag}_{}",
             uuid::Uuid::now_v7()
         ));
-        let store = JsonlStore::new(&dir).unwrap();
+        let store = Store::new(&dir).unwrap();
         (store, dir)
     }
 
@@ -1292,7 +1292,7 @@ mod tests {
         let _id2 = store.create_entry(e2).unwrap().id;
         let _id3 = store.create_entry(e3).unwrap().id;
 
-        fn ids(store: &JsonlStore, query: &crate::query::ResolvedQuery) -> Vec<crate::domain::EntryId> {
+        fn ids(store: &Store, query: &crate::query::ResolvedQuery) -> Vec<crate::domain::EntryId> {
             store
                 .find_entries_by_query(query, None)
                 .unwrap()

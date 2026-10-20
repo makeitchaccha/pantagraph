@@ -4,7 +4,7 @@ use std::fmt;
 use crate::config::DuplicatePolicy;
 use crate::domain::{Tag, TagId};
 use crate::query::{Query, ResolvedQuery};
-use crate::store::JsonlStore;
+use crate::store::Store;
 
 #[derive(Debug)]
 pub enum TagResult {
@@ -93,7 +93,7 @@ pub fn parse_tag_ref(input: &str) -> (&str, Option<&str>, Option<usize>) {
 }
 
 /// Resolve a tag reference to a single tag, preserving the CLI's disambiguation behavior.
-pub fn resolve_tag(store: &JsonlStore, name_or_id: &str) -> Result<Tag> {
+pub fn resolve_tag(store: &Store, name_or_id: &str) -> Result<Tag> {
     if let Ok(tag_id) = name_or_id.parse::<TagId>() {
         if let Some(tag) = store.find_tag_by_id(&tag_id)? {
             return Ok(tag);
@@ -159,7 +159,7 @@ pub fn resolve_tag(store: &JsonlStore, name_or_id: &str) -> Result<Tag> {
 ///
 /// Resolution uses the same rules as `-t` references, including `#N`
 /// and `@specifier` disambiguation.
-pub fn resolve_query(store: &JsonlStore, query: &Query) -> Result<ResolvedQuery> {
+pub fn resolve_query(store: &Store, query: &Query) -> Result<ResolvedQuery> {
     let resolved = match query {
         Query::Tag(tag_ref) => Query::Tag(resolve_tag(store, tag_ref)?.id),
         // Meta predicates are self-resolving; they carry no tag reference.
@@ -185,7 +185,7 @@ pub fn resolve_query(store: &JsonlStore, query: &Query) -> Result<ResolvedQuery>
 }
 
 pub fn handle_tag_create(
-    store: &JsonlStore,
+    store: &Store,
     name: String,
     specifier: Option<String>,
     description: String,
@@ -205,7 +205,7 @@ pub fn handle_tag_create(
 }
 
 fn handle_tag_create_inner(
-    store: &JsonlStore,
+    store: &Store,
     name: String,
     mut specifier: Option<String>,
     description: String,
@@ -290,7 +290,7 @@ fn handle_tag_create_inner(
 }
 
 pub fn handle_tag_list(
-    store: &JsonlStore,
+    store: &Store,
     name_filter: Option<String>,
     limit: Option<usize>,
     offset: Option<usize>,
@@ -321,14 +321,14 @@ pub fn handle_tag_list(
     Ok(TagResult::Listed(tags))
 }
 
-pub fn handle_tag_show(store: &JsonlStore, name_or_id: String) -> Result<TagResult> {
+pub fn handle_tag_show(store: &Store, name_or_id: String) -> Result<TagResult> {
     let tag = resolve_tag(store, &name_or_id)?;
     let entries = store.find_entries_by_tag(&tag.id)?;
     Ok(TagResult::Show { tag, entries })
 }
 
 pub fn handle_tag_rename(
-    store: &JsonlStore,
+    store: &Store,
     name_or_id: String,
     new_name: String,
 ) -> Result<TagResult> {
@@ -346,7 +346,7 @@ pub fn handle_tag_rename(
 }
 
 pub fn handle_tag_alias_add(
-    store: &JsonlStore,
+    store: &Store,
     name_or_id: String,
     alias: String,
 ) -> Result<TagResult> {
@@ -359,7 +359,7 @@ pub fn handle_tag_alias_add(
 }
 
 pub fn handle_tag_alias_remove(
-    store: &JsonlStore,
+    store: &Store,
     name_or_id: String,
     alias: String,
 ) -> Result<TagResult> {
@@ -371,7 +371,7 @@ pub fn handle_tag_alias_remove(
     })
 }
 
-pub fn handle_tag_alias_list(store: &JsonlStore, name_or_id: String) -> Result<TagResult> {
+pub fn handle_tag_alias_list(store: &Store, name_or_id: String) -> Result<TagResult> {
     let tag = resolve_tag(store, &name_or_id)?;
     Ok(TagResult::AliasList(tag))
 }
@@ -400,7 +400,7 @@ mod tests {
             "pantagraph_test_ambiguity_{}",
             uuid::Uuid::now_v7()
         ));
-        let store = JsonlStore::new(&dir).unwrap();
+        let store = Store::new(&dir).unwrap();
         store.create_tag(Tag::new("dup", "first")).unwrap();
         store
             .create_tag(Tag::with_specifier(
@@ -440,7 +440,7 @@ mod tests {
     fn test_unambiguous_ref_is_not_ambiguity() {
         let dir =
             std::env::temp_dir().join(format!("pantagraph_test_unique_{}", uuid::Uuid::now_v7()));
-        let store = JsonlStore::new(&dir).unwrap();
+        let store = Store::new(&dir).unwrap();
         store.create_tag(Tag::new("only", "")).unwrap();
 
         let tag = resolve_tag(&store, "only").unwrap();

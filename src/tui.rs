@@ -17,7 +17,7 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use pantagraph::domain::{Entry, Tag, TagId};
-use pantagraph::store::JsonlStore;
+use pantagraph::store::Store;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
@@ -88,7 +88,7 @@ impl App {
     /// Success resets the page and selection; failure keeps the previous
     /// results and reports the error inside the TUI. An ambiguous tag
     /// reference opens the candidate picker instead of an error line.
-    fn execute(&mut self, store: &JsonlStore) {
+    fn execute(&mut self, store: &Store) {
         match entry::handle_entry_search_page(store, &self.query, 0) {
             Ok(page) => {
                 self.page = 0;
@@ -114,7 +114,7 @@ impl App {
         }
     }
 
-    fn load_page(&mut self, store: &JsonlStore) {
+    fn load_page(&mut self, store: &Store) {
         match entry::handle_entry_search_page(store, &self.query, self.page) {
             Ok(page) => self.apply(page),
             Err(e) => self.error = Some(format!("{e:#}")),
@@ -128,7 +128,7 @@ impl App {
         self.error = None;
     }
 
-    fn next_page(&mut self, store: &JsonlStore) {
+    fn next_page(&mut self, store: &Store) {
         if !self.has_more {
             return;
         }
@@ -137,7 +137,7 @@ impl App {
         self.load_page(store);
     }
 
-    fn prev_page(&mut self, store: &JsonlStore) {
+    fn prev_page(&mut self, store: &Store) {
         if self.page == 0 {
             return;
         }
@@ -157,7 +157,7 @@ impl App {
     }
 
     /// Re-query tag suggestions for the word currently being typed.
-    fn refresh_suggestions(&mut self, store: &JsonlStore) {
+    fn refresh_suggestions(&mut self, store: &Store) {
         self.suggestions.clear();
         self.suggestion = 0;
         let word = word_at_end(&self.query).to_string();
@@ -178,7 +178,7 @@ impl App {
     }
 
     /// Replace the word being typed with the selected suggestion.
-    fn accept_suggestion(&mut self, store: &JsonlStore) {
+    fn accept_suggestion(&mut self, store: &Store) {
         let Some(tag) = self.suggestions.get(self.suggestion) else {
             return;
         };
@@ -268,7 +268,7 @@ fn replace_word(query: &str, word: &str, replacement: &str) -> String {
 }
 
 /// Launch the interactive TUI on the given store.
-pub fn run(store: &JsonlStore) -> Result<()> {
+pub fn run(store: &Store) -> Result<()> {
     let mut terminal = ratatui::init();
     let mut app = App::new();
     app.execute(store);
@@ -279,7 +279,7 @@ pub fn run(store: &JsonlStore) -> Result<()> {
 
 fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
-    store: &JsonlStore,
+    store: &Store,
     app: &mut App,
 ) -> Result<()> {
     loop {
@@ -300,7 +300,7 @@ enum Flow {
     Quit,
 }
 
-fn handle_key(app: &mut App, store: &JsonlStore, key: KeyEvent) -> Flow {
+fn handle_key(app: &mut App, store: &Store, key: KeyEvent) -> Flow {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match app.mode.clone() {
         Mode::Normal => match key.code {
@@ -537,17 +537,17 @@ mod tests {
     use pantagraph::domain::{Entry, Tag};
     use std::path::PathBuf;
 
-    fn temp_store(tag: &str) -> (JsonlStore, PathBuf) {
+    fn temp_store(tag: &str) -> (Store, PathBuf) {
         let dir = std::env::temp_dir().join(format!(
             "pantagraph_test_tui_{tag}_{}",
             uuid::Uuid::now_v7()
         ));
-        let store = JsonlStore::new(&dir).unwrap();
+        let store = Store::new(&dir).unwrap();
         (store, dir)
     }
 
     /// Create a tag plus `count` entries tagged with it, URLs `https://example.test/{i}`.
-    fn seed_entries(store: &JsonlStore, tag_name: &str, count: usize) -> TagId {
+    fn seed_entries(store: &Store, tag_name: &str, count: usize) -> TagId {
         let tag_id = store.create_tag(Tag::new(tag_name, "")).unwrap().id;
         for i in 0..count {
             store

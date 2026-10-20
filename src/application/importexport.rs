@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 use crate::domain::{Entry, EntryId, Tag, TagId};
-use crate::store::JsonlStore;
+use crate::store::Store;
 
 #[derive(Debug)]
 pub struct ExportResult {
@@ -129,7 +129,7 @@ fn save_jsonl<T: serde::Serialize>(path: &Path, values: &[T]) -> Result<()> {
     Ok(())
 }
 
-pub fn handle_export(store: &JsonlStore, out_dir: Option<String>) -> Result<ExportResult> {
+pub fn handle_export(store: &Store, out_dir: Option<String>) -> Result<ExportResult> {
     let out_dir = match out_dir {
         Some(dir) => PathBuf::from(dir),
         None => store.data_dir().to_path_buf(),
@@ -150,7 +150,7 @@ pub fn handle_export(store: &JsonlStore, out_dir: Option<String>) -> Result<Expo
 }
 
 pub fn handle_import(
-    store: &JsonlStore,
+    store: &Store,
     in_dir: Option<String>,
     overwrite: bool,
 ) -> Result<ImportResult> {
@@ -199,7 +199,7 @@ mod tests {
     fn test_export_import_round_trip() {
         let store_dir = temp_dir("rt_store");
         let out_dir = temp_dir("rt_out");
-        let store = JsonlStore::new(&store_dir).unwrap();
+        let store = Store::new(&store_dir).unwrap();
 
         let rust = Tag::with_aliases("rust", "lang", vec!["rs".to_string()]);
         let game = Tag::with_specifier("game", Some("jp".to_string()), "games", vec![]);
@@ -226,7 +226,7 @@ mod tests {
         assert!(out_dir.join("entries.jsonl").exists());
 
         let store2_dir = temp_dir("rt_store2");
-        let store2 = JsonlStore::new(&store2_dir).unwrap();
+        let store2 = Store::new(&store2_dir).unwrap();
         let imported =
             handle_import(&store2, Some(out_dir.to_string_lossy().into()), false).unwrap();
         assert_eq!(imported.tag_count, 2);
@@ -259,7 +259,7 @@ mod tests {
     fn test_import_gating() {
         let store_dir = temp_dir("gate_store");
         let src_dir = temp_dir("gate_src");
-        let store = JsonlStore::new(&store_dir).unwrap();
+        let store = Store::new(&store_dir).unwrap();
 
         // Non-empty source
         let tag = Tag::new("t", "d");
@@ -271,7 +271,7 @@ mod tests {
 
         // Non-empty target, no --overwrite -> refuse
         let target_dir = temp_dir("gate_target");
-        let target = JsonlStore::new(&target_dir).unwrap();
+        let target = Store::new(&target_dir).unwrap();
         target.create_tag(Tag::new("existing", "keep")).unwrap();
         let err = handle_import(&target, Some(src_dir.to_string_lossy().into()), false);
         assert!(err.is_err());
@@ -296,7 +296,7 @@ mod tests {
         let store_dir = temp_dir("miss_store");
         let empty_dir = temp_dir("miss_empty");
         std::fs::create_dir_all(&empty_dir).unwrap();
-        let store = JsonlStore::new(&store_dir).unwrap();
+        let store = Store::new(&store_dir).unwrap();
 
         let err = handle_import(&store, Some(empty_dir.to_string_lossy().into()), false);
         assert!(err.is_err());
@@ -316,7 +316,7 @@ mod tests {
         let entry = Entry::new("https://only.entries", "desc", vec![unknown]);
         save_jsonl(&entries_path(&src_dir), std::slice::from_ref(&entry)).unwrap();
 
-        let store = JsonlStore::new(&store_dir).unwrap();
+        let store = Store::new(&store_dir).unwrap();
         let res = handle_import(&store, Some(src_dir.to_string_lossy().into()), false).unwrap();
         assert_eq!(res.tag_count, 0);
         assert_eq!(res.entry_count, 1);
@@ -332,7 +332,7 @@ mod tests {
     fn test_export_preserves_entry_order() {
         let store_dir = temp_dir("ord_store");
         let out_dir = temp_dir("ord_out");
-        let store = JsonlStore::new(&store_dir).unwrap();
+        let store = Store::new(&store_dir).unwrap();
         let ids: Vec<EntryId> = (0..5)
             .map(|i| {
                 store
