@@ -174,19 +174,151 @@ fn migrate_archiver_to_meta(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Schema version this build understands; the database records how far it has
+/// been upgraded via SQLite's native `PRAGMA user_version`.
+const SCHEMA_VERSION: i64 = 2;
+
+fn set_schema_version(conn: &Connection, version: i64) -> Result<()> {
+    conn.execute(&format!("PRAGMA user_version = {version}"), [])
+        .with_context(|| format!("Failed to set schema version to {version}"))?;
+    Ok(())
+}
+
 pub fn open_store_db(path: &Path) -> Result<Connection> {
     let conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
     )
     .with_context(|| format!("Failed to open store DB {}", path.display()))?;
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+
     conn.execute_batch(SCHEMA)
         .context("Failed to init schema")?;
-    migrate_legacy_schema(&conn).context("Failed to migrate internal integer IDs")?;
+    if version < 1 {
+        migrate_legacy_schema(&conn).context("Failed to migrate internal integer IDs")?;
+        set_schema_version(&conn, 1)?;
+    }
     conn.execute_batch(META_SCHEMA)
         .context("Failed to init meta schema")?;
     migrate_archiver_to_meta(&conn).context("Failed to migrate archiver columns to meta")?;
     conn.execute_batch(INDEXES)
         .context("Failed to init indexes")?;
+
+    if version < SCHEMA_VERSION {
+        // shortcut: flat forward-only steps keyed off SCHEMA_VERSION, no
+        // branching or downgrade support — ceiling: unforeseen future step
+        // shapes, upgrade: append the next step and bump SCHEMA_VERSION.
+        set_schema_version(&conn, SCHEMA_VERSION)?;
+    }
     Ok(conn)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn temp_db_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("pantagraph_test_db_{tag}_{}", uuid::Uuid::now_v7()))
+    }
+
+    fn schema_version(conn: &Connection) -> Result<i64> {
+        Ok(conn.query_row("PRAGMA user_version", [], |row| row.get(0))?)
+    }
+
+    #[test]
+    fn fresh_db_gets_current_schema_and_version() {
+        let path = temp_db_path("fresh");
+        let conn = open_store_db(&path).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
+
+        let has_internal_id: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('entries') WHERE name = 'internal_id')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+        assert!(has_internal_id);
+        let has_archiver: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('entries') WHERE name = 'archiver')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!has_archiver);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn legacy_db_is_migrated_and_stamped() {
+        let path = temp_db_path("legacy");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE tags (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    specifier TEXT,
+                    description TEXT NOT NULL DEFAULT '',
+                    aliases TEXT NOT NULL DEFAULT '[]'
+                );
+                CREATE TABLE entries (
+                    id TEXT PRIMARY KEY,
+                    url TEXT NOT NULL,
+                    archiver TEXT,
+                    archive_path TEXT,
+                    description TEXT NOT NULL DEFAULT '',
+                    ordinal INTEGER NOT NULL
+                );
+                CREATE TABLE entry_tags (
+                    entry_id TEXT NOT NULL,
+                    tag_id TEXT NOT NULL,
+                    PRIMARY KEY (entry_id, tag_id),
+                    FOREIGN KEY (entry_id) REFERENCES entries(id),
+                    FOREIGN KEY (tag_id) REFERENCES tags(id)
+                );
+            "#,
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO tags (id, name, specifier, description, aliases) VALUES ('t1', 'tag', NULL, 'd', '[]')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO entries (id, url, archiver, archive_path, description, ordinal) VALUES ('e1', 'https://x.test/', 'curl', 'archives/a.html', 'd', 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO entry_tags (entry_id, tag_id) VALUES ('e1', 't1')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let conn = open_store_db(&path).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
+
+        let entry_internal_id: i64 = conn
+            .query_row(
+                "SELECT internal_id FROM entries WHERE id = 'e1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let archiver: Option<String> = conn
+            .query_row(
+                "SELECT em.value FROM entry_meta em
+                 JOIN meta_keys mk ON mk.internal_id = em.key_id
+                 WHERE em.entry_id = ?1 AND mk.key = 'archiver'",
+                [&entry_internal_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(archiver.as_deref(), Some("curl"));
+        let _ = std::fs::remove_file(&path);
+    }
 }
